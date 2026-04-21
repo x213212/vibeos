@@ -1498,6 +1498,8 @@ static int is_name_completion_cmd(const char *cmd) {
            strcmp(cmd, "wrp") == 0 ||
            strcmp(cmd, "write") == 0 ||
            strcmp(cmd, "mkdir") == 0 ||
+           strcmp(cmd, "gbemu") == 0 ||
+           strcmp(cmd, "netsurf") == 0 ||
            strcmp(cmd, "rm") == 0 ||
            strcmp(cmd, "touch") == 0 ||
            strcmp(cmd, "vim") == 0 ||
@@ -1529,6 +1531,8 @@ static int terminal_command_uses_path_completion(const char *cmd) {
            strcmp(cmd, "write") == 0 ||
            strcmp(cmd, "open") == 0 ||
            strcmp(cmd, "run") == 0 ||
+           strcmp(cmd, "gbemu") == 0 ||
+           strcmp(cmd, "netsurf") == 0 ||
            strcmp(cmd, "source") == 0;
 }
 
