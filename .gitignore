@@ -8,3 +8,4 @@ wrp/go-build/
 /tmp/mbedtls-rv-build/
 **/.*.swp
 **/.*.swo
+hdd_backups/

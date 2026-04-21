@@ -146,6 +146,9 @@ ifeq ($(ENABLE_AUDIO),1)
 QFLAGS += -audiodev pa,id=snd0,server=unix:/mnt/wslg/PulseServer -device AC97,audiodev=snd0
 endif
 
+HDD_BACKUP_DIR ?= hdd_backups
+HDD_BACKUP_KEEP ?= 10
+
 all: os.elf hdd.dsk qemu
 
 test: os.elf qemu
@@ -169,8 +172,15 @@ $(BUILD_DIR)/%.o: %.s
 
 -include $(DEPS)
 
-qemu: os.elf hdd.dsk
+qemu: os.elf hdd.dsk backup-hdd
 	$(QEMU) $(QFLAGS) -kernel os.elf
+
+backup-hdd: hdd.dsk
+	@mkdir -p $(HDD_BACKUP_DIR)
+	@backup="$(HDD_BACKUP_DIR)/hdd-$$(date +%Y%m%d-%H%M%S).dsk"; \
+	cp -p hdd.dsk "$$backup"; \
+	echo "HDD backup: $$backup"; \
+	ls -1t $(HDD_BACKUP_DIR)/hdd-*.dsk 2>/dev/null | tail -n +$$(($(HDD_BACKUP_KEEP) + 1)) | xargs -r rm -f
 
 clean:
 	rm -rf $(BUILD_DIR) *.elf *.img
