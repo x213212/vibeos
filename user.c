@@ -3773,7 +3773,6 @@ void gui_task(void) {
         reset_window(&wins[i], i); 
         z_order[i] = i; 
         wins[i].cmd_buf[0] = '\0';
-        wins[i].prompt_input[0] = '\0';
     }
     
     // Create initial terminal window and set focus
