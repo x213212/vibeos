@@ -1,6 +1,5 @@
 *.o
 *.elf
-*.dsk
 *.bin
 wrp/wrp
 wrp/go-build/

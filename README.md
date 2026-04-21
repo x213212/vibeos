@@ -252,7 +252,13 @@ Requires:
 - GNU make
 - Pre-built mbedTLS RISC-V static libs (default at `/tmp/mbedtls-rv-build`)
 
-To build:
+To create the disk image (first time only):
+
+```sh
+dd if=/dev/urandom of=hdd.dsk bs=1M count=32
+```
+
+To build and run:
 
 ```sh
 make -j2 os.elf
