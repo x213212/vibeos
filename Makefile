@@ -12,7 +12,7 @@ NSFB_DIR = $(THIRD_PARTY_DIR)/libnsfb
 WCAP_DIR = $(THIRD_PARTY_DIR)/libwapcaplet
 PUTIL_DIR = $(THIRD_PARTY_DIR)/libparserutils
 HUB_DIR = $(THIRD_PARTY_DIR)/libhubbub
-TCC_DIR = /root/trade_new/os/mini-riscv-os/tcc-riscv32
+TCC_DIR = $(THIRD_PARTY_DIR)/tcc-riscv32
 
 CFLAGS = -nostdlib -fno-builtin -mcmodel=medany -march=rv32imac -mabi=ilp32 -DLWIP_NO_CTYPE_H -DWITHOUT_ICONV_FILTER -g -Wall -w \
          -mno-relax \

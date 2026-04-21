@@ -4,6 +4,7 @@ Lineage:
 
 - Original project: [cccriscv/mini-riscv-os](https://github.com/cccriscv/mini-riscv-os)
 - Referenced fork/base: [x213212/mini-riscv-os](https://github.com/x213212/mini-riscv-os)
+- Bundled JIT compiler: Tiny C Compiler (TCC), LGPL-2.1, with modified source in `third_party/tcc-riscv32/`
 - This integration: `vibe-os`, based on `08-BlockDeviceDriver`, adding GUI networking, WRP, and browser support.
 
 <img width="1100" height="890" alt="image" src="https://github.com/user-attachments/assets/b1d2adb4-ee97-4041-b7a0-49c18a2152e6" />
@@ -297,4 +298,3 @@ This project integrates several open-source components:
 - **WRP**: Distributed under the **Apache License 2.0**.
 
 For complete license texts, please see the [LICENSE](LICENSE) file.
-
