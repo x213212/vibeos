@@ -1554,7 +1554,7 @@ static void apply_completion(struct Window *w, int row, int token_start, int tok
 
 static int tab_complete_command(struct Window *w, int row, int token_start, int token_end) {
     static const char *cmds[] = {
-        "pwd", "format", "cd", "ls", "mkdir", "rm", "touch", "write", "cat", "wget", "open", "run", "gbemu", "demo3d", "help", "clear", "mv", "rename", "netsurf", "ssh", "wrp", "find", "mem", "df", "du", "alias", "unalias", "export", "unset", "source"
+        "pwd", "format", "cd", "ls", "mkdir", "rm", "touch", "write", "cat", "wget", "open", "run", "gbemu", "demo3d", "frankenstein", "help", "clear", "mv", "rename", "netsurf", "ssh", "wrp", "find", "mem", "df", "du", "alias", "unalias", "export", "unset", "source"
     };
     char prefix[COLS];
     int plen = token_end - token_start;
@@ -3148,7 +3148,7 @@ void exec_single_cmd(struct Window *w, char *cmd) {
                  total*4, used*4, free_pg*4, m_calls, f_calls);
         lib_strcpy(out, row);
     } else if (strncmp(cmd, "help", 4) == 0) {
-        lib_strcpy(out, "Commands: ls, find, mem, df, du, mkdir, rm, touch, cd, pwd, write, cat, wget, open, run, gbemu, vim, asm, demo3d, netsurf, ssh, wrp, format, clear, env, export, unset, alias, unalias, source, ., echo\nType '<cmd> h' for usage.");
+        lib_strcpy(out, "Commands: ls, find, mem, df, du, mkdir, rm, touch, cd, pwd, write, cat, wget, open, run, gbemu, vim, asm, demo3d, frankenstein, netsurf, ssh, wrp, format, clear, env, export, unset, alias, unalias, source, ., echo\nType '<cmd> h' for usage.");
     } else { lib_strcpy(out, "Invalid signal."); }
 }
 
