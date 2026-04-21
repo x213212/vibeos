@@ -19,6 +19,8 @@ Lineage:
 <img width="1100" height="890" alt="image" src="https://github.com/user-attachments/assets/6712ed96-689a-4d38-b809-7d2b2cd451a9" />
 <img width="1100" height="890" alt="image" src="https://github.com/user-attachments/assets/69e17ad8-be37-49eb-8a0f-a307290ed469" />
 <img width="1100" height="890" alt="image" src="https://github.com/user-attachments/assets/bb8603cb-ff2b-4c99-afd9-ae6c53804b5c" />
+<img width="1100" height="890" alt="image" src="https://github.com/user-attachments/assets/8faaef63-fe46-4651-9fed-629ccebea928" />
+
 
 
 This project extends from the `08-BlockDeviceDriver` stage of `mini-riscv-os`, adding a GUI, networking, NetSurf-style browser frontend, WRP server integration, and modern web browsing capabilities.
