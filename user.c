@@ -148,6 +148,7 @@ static void shorten_path_for_title(char *dst, const char *src, int max_len) {
     int keep = max_len - 3;
     int start = src_len - keep;
     if (start < 0) start = 0;
+    int len = 0;
     for (len = 0; len < keep && src[start + len]; len++) {
         dst[3 + len] = src[start + len];
     }
