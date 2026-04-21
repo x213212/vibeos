@@ -22,6 +22,15 @@
 
 #include "mbedtls/platform.h"
 
+#ifndef SSH_DEBUG_LOG
+#define SSH_DEBUG_LOG 0
+#endif
+
+#if !SSH_DEBUG_LOG
+#undef mbedtls_printf
+#define mbedtls_printf(...) do { } while (0)
+#endif
+
 #define ENTROPY_MAX_LOOP    256     /**< Maximum amount to loop before error */
 
 void mbedtls_entropy_init(mbedtls_entropy_context *ctx)

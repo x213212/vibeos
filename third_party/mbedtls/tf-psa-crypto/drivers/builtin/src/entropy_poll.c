@@ -18,6 +18,15 @@
 #include "mbedtls/private/error_common.h"
 #include <psa/crypto_driver_random.h>
 
+#ifndef SSH_DEBUG_LOG
+#define SSH_DEBUG_LOG 0
+#endif
+
+#if !SSH_DEBUG_LOG
+#undef mbedtls_printf
+#define mbedtls_printf(...) do { } while (0)
+#endif
+
 /* In principle, we could support both a built-in source and a custom
  * source. However, it isn't a common need. So for now the two
  * callback functions have the same name and there can only be one. */

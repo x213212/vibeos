@@ -11,6 +11,14 @@
 #include "stdio.h"
 #include "sys/select.h"
 
+#ifndef SSH_DEBUG_LOG
+#define SSH_DEBUG_LOG 0
+#endif
+
+#if !SSH_DEBUG_LOG
+#define lib_printf(...) do { } while (0)
+#endif
+
 int errno;
 FILE *stderr;
 

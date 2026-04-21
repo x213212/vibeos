@@ -16,6 +16,15 @@
 #include "psa_crypto_random_impl.h"
 #include "threading_internal.h"
 
+#ifndef SSH_DEBUG_LOG
+#define SSH_DEBUG_LOG 0
+#endif
+
+#if !SSH_DEBUG_LOG
+#undef mbedtls_printf
+#define mbedtls_printf(...) do { } while (0)
+#endif
+
 #if defined(MBEDTLS_PLATFORM_IS_UNIXLIKE)
 /* For getpid(), for fork protection */
 #include <unistd.h>

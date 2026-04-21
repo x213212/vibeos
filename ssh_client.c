@@ -7,6 +7,14 @@
 #include "lwip/ip_addr.h"
 #include "lwip/pbuf.h"
 
+#ifndef SSH_DEBUG_LOG
+#define SSH_DEBUG_LOG 0
+#endif
+
+#if !SSH_DEBUG_LOG
+#define lib_printf(...) do { } while (0)
+#endif
+
 #define SSH_RX_BUF_SIZE (64 * 1024)
 #define SSH_CONNECT_TIMEOUT_MS 15000U
 #define SSH_AUTH_TIMEOUT_MS 15000U

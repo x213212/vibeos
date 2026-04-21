@@ -33,6 +33,15 @@
 
 #include "mbedtls/platform.h"
 
+#ifndef SSH_DEBUG_LOG
+#define SSH_DEBUG_LOG 0
+#endif
+
+#if !SSH_DEBUG_LOG
+#undef mbedtls_printf
+#define mbedtls_printf(...) do { } while (0)
+#endif
+
 #if defined(MBEDTLS_CTR_DRBG_USE_PSA_CRYPTO)
 static psa_status_t ctr_drbg_setup_psa_context(mbedtls_ctr_drbg_psa_context *psa_ctx,
                                                unsigned char *key, size_t key_len)

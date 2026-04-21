@@ -1,6 +1,7 @@
 *.o
 *.elf
 *.bin
+*.dsk
 .build/
 wrp/wrp
 wrp/go-build/
@@ -9,3 +10,6 @@ wrp/go-build/
 **/.*.swp
 **/.*.swo
 hdd_backups/
+
+__pycache__/
+*.pyc

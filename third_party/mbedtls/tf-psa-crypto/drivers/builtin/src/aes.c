@@ -40,6 +40,14 @@
 #include "mbedtls/platform.h"
 #include "ctr.h"
 
+#ifndef SSH_DEBUG_LOG
+#define SSH_DEBUG_LOG 0
+#endif
+
+#if !SSH_DEBUG_LOG
+#define lib_printf(...) do { } while (0)
+#endif
+
 /*
  * This is a convenience shorthand macro to check if we need reverse S-box and
  * reverse tables. It's private and only defined in this file.

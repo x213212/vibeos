@@ -298,10 +298,14 @@ static void clear_window_input_queue(struct Window *w) {
 struct Window wins[MAX_WINDOWS];
 static void clear_prompt_input(struct Window *w);
 static int terminal_is_ssh_auth_request(const char *cmd);
+static int terminal_is_ssh_boot_seal_request(const char *cmd);
 static void terminal_begin_ssh_auth(struct Window *w);
+static void terminal_begin_ssh_boot_seal(struct Window *w);
 static void terminal_refresh_ssh_auth_prompt(struct Window *w);
 static void terminal_cancel_ssh_auth(struct Window *w);
 static void terminal_submit_ssh_auth(struct Window *w);
+static int sshboot_password_obfuscate(const char *password, char *out, int out_max);
+static void terminal_load_sshboot(struct Window *w);
 static void append_terminal_line(struct Window *w, const char *text);
 static void terminal_app_stdout_flush(struct Window *w);
 void redraw_prompt_line(struct Window *w, int row);
@@ -311,6 +315,8 @@ static void set_shell_status(struct Window *w, const char *msg);
 static int terminal_visible_rows(struct Window *w);
 void close_window(int idx);
 static void seed_terminal_history(struct Window *w);
+static int path_is_sftp(const char *path);
+static const char *sftp_subpath(const char *path);
 static void release_app_owner_command_state(void) {
     if (app_owner_win_id < 0 || app_owner_win_id >= MAX_WINDOWS) {
         app_owner_win_id = -1;
@@ -470,30 +476,52 @@ static int terminal_is_ssh_auth_request(const char *cmd) {
     return (*p == '\0');
 }
 
+static int terminal_is_ssh_boot_seal_request(const char *cmd) {
+    const char *p;
+    if (!cmd) return 0;
+    while (*cmd == ' ' || *cmd == '\t') cmd++;
+    if (strncmp(cmd, "ssh boot seal", 13) != 0) return 0;
+    p = cmd + 13;
+    while (*p == ' ' || *p == '\t') p++;
+    return (*p == '\0');
+}
+
 static void terminal_refresh_ssh_auth_prompt(struct Window *w) {
     char display[COLS];
+    const char *prefix;
+    int prefix_len;
     int i;
     if (!w || !w->ssh_auth_mode) return;
-    lib_strcpy(display, "ssh auth ");
-    for (i = 0; i < w->ssh_auth_len && (9 + i) < COLS - 1; i++) {
-        display[9 + i] = '*';
+    prefix = (w->ssh_auth_mode == 2) ? "ssh boot seal " : "ssh auth ";
+    prefix_len = (int)strlen(prefix);
+    lib_strcpy(display, prefix);
+    for (i = 0; i < w->ssh_auth_len && (prefix_len + i) < COLS - 1; i++) {
+        display[prefix_len + i] = '*';
     }
-    display[9 + i] = '\0';
+    display[prefix_len + i] = '\0';
     lib_strcpy(w->cmd_buf, display);
-    w->edit_len = 9 + i;
+    w->edit_len = prefix_len + i;
     w->cursor_pos = w->edit_len;
     if (w->total_rows > 0) redraw_prompt_line(w, w->total_rows - 1);
 }
 
-static void terminal_begin_ssh_auth(struct Window *w) {
+static void terminal_begin_ssh_secret(struct Window *w, int mode) {
     if (!w || w->kind != WINDOW_KIND_TERMINAL) return;
-    w->ssh_auth_mode = 1;
+    w->ssh_auth_mode = mode;
     w->ssh_auth_len = 0;
     w->ssh_auth_buf[0] = '\0';
     w->submit_locked = 0;
     clear_prompt_input(w);
     terminal_refresh_ssh_auth_prompt(w);
     terminal_scroll_to_bottom(w);
+}
+
+static void terminal_begin_ssh_auth(struct Window *w) {
+    terminal_begin_ssh_secret(w, 1);
+}
+
+static void terminal_begin_ssh_boot_seal(struct Window *w) {
+    terminal_begin_ssh_secret(w, 2);
 }
 
 static void terminal_cancel_ssh_auth(struct Window *w) {
@@ -511,7 +539,31 @@ static void terminal_submit_ssh_auth(struct Window *w) {
     char msg[OUT_BUF_SIZE];
     if (!w || !w->ssh_auth_mode) return;
     msg[0] = '\0';
-    if (ssh_client_set_password(w->ssh_auth_buf, msg, OUT_BUF_SIZE) == 0) {
+    if (w->ssh_auth_mode == 2) {
+        char enc[160];
+        char target[96];
+        char tmpl[512];
+        if (sshboot_password_obfuscate(w->ssh_auth_buf, enc, sizeof(enc)) == 0) {
+            if (ssh_client_get_target(target, sizeof(target)) != 0 || target[0] == '\0') {
+                lib_strcpy(target, "root@192.168.123.100:2221");
+            }
+            snprintf(tmpl, sizeof(tmpl),
+                     "# ssh auto-login boot config\n"
+                     "# password_obf is obfuscated, not strong encryption\n"
+                     "target=%s\n"
+                     "password_obf=%s\n"
+                     "sftp=/root/trade_new/os/mini-riscv-os/08-BlockDeviceDriver/http_test\n",
+                     target, enc);
+            if (store_file_bytes(w, "~/.sshboot", (const unsigned char *)tmpl, (uint32_t)strlen(tmpl)) == 0) {
+                terminal_load_sshboot(w);
+                append_terminal_line(w, "OK: wrote obfuscated ~/.sshboot and loaded it.");
+            } else {
+                append_terminal_line(w, "ERR: cannot write ~/.sshboot.");
+            }
+        } else {
+            append_terminal_line(w, "ERR: password too long.");
+        }
+    } else if (ssh_client_set_password(w->ssh_auth_buf, msg, OUT_BUF_SIZE) == 0) {
         append_terminal_line(w, msg[0] ? msg : "OK: ssh password stored.");
     } else {
         if (msg[0] == '\0') lib_strcpy(msg, "ERR: ssh auth <password>.");
@@ -551,16 +603,19 @@ static void seed_terminal_history(struct Window *w) {
     terminal_history_set(w, 8, "ls /sftp");
     terminal_history_set(w, 9, "cat /sftp/jit_memtest.c");
     terminal_history_set(w, 10, "jit /sftp/jit_memtest.c");
-    terminal_history_set(w, 11, "ssh exec uname -a");
-    terminal_history_set(w, 12, "ssh exec ls");
-    terminal_history_set(w, 13, "wrp set http://192.168.123.100:9999");
-    terminal_history_set(w, 14, "netsurf https://duckduckgo.com");
-    terminal_history_set(w, 15, "gbemu lez.gb");
-    w->hist_count = 16;
+    terminal_history_set(w, 11, "jit shared reset");
+    terminal_history_set(w, 12, "jit bg /sftp/jit_consumer.c");
+    terminal_history_set(w, 13, "jit bg /sftp/jit_producer.c");
+    terminal_history_set(w, 14, "jit ps");
+    terminal_history_set(w, 15, "ssh boot init");
+    terminal_history_set(w, 16, "vim ~/.sshboot");
+    terminal_history_set(w, 17, "gbemu lez.gb");
+    w->hist_count = 18;
     w->hist_idx = -1;
 }
 
 static void terminal_source_script(struct Window *w, const char *path);
+static void terminal_load_sshboot(struct Window *w);
 static int terminal_alias_set(struct Window *w, const char *name, const char *value);
 static int terminal_alias_unset(struct Window *w, const char *name);
 static const char *terminal_alias_get(struct Window *w, const char *name);
@@ -729,6 +784,163 @@ static void terminal_source_script(struct Window *w, const char *path) {
     terminal_source_depth--;
 }
 
+static unsigned char sshboot_hex_val(char c) {
+    if (c >= '0' && c <= '9') return (unsigned char)(c - '0');
+    if (c >= 'a' && c <= 'f') return (unsigned char)(c - 'a' + 10);
+    if (c >= 'A' && c <= 'F') return (unsigned char)(c - 'A' + 10);
+    return 255;
+}
+
+static unsigned char sshboot_keystream_next(uint32_t *state) {
+    *state ^= (*state << 13);
+    *state ^= (*state >> 17);
+    *state ^= (*state << 5);
+    return (unsigned char)((*state >> 24) & 0xff);
+}
+
+static int sshboot_password_obfuscate(const char *password, char *out, int out_max) {
+    static const char hex[] = "0123456789abcdef";
+    uint32_t state = 0x6d2b79f5u;
+    int len;
+    int pos = 3;
+    if (!password || !out || out_max < 8) return -1;
+    len = (int)strlen(password);
+    if (len <= 0 || pos + len * 2 + 1 > out_max) return -1;
+    out[0] = 'v';
+    out[1] = '1';
+    out[2] = ':';
+    for (int i = 0; i < len; i++) {
+        unsigned char b = (unsigned char)password[i] ^ sshboot_keystream_next(&state);
+        out[pos++] = hex[(b >> 4) & 15];
+        out[pos++] = hex[b & 15];
+    }
+    out[pos] = '\0';
+    return 0;
+}
+
+static int sshboot_password_deobfuscate(const char *encoded, char *out, int out_max) {
+    uint32_t state = 0x6d2b79f5u;
+    int len;
+    int pos = 0;
+    if (!encoded || !out || out_max <= 0) return -1;
+    if (strncmp(encoded, "v1:", 3) == 0) encoded += 3;
+    len = (int)strlen(encoded);
+    if (len <= 0 || (len & 1) != 0 || len / 2 >= out_max) return -1;
+    for (int i = 0; i < len; i += 2) {
+        unsigned char hi = sshboot_hex_val(encoded[i]);
+        unsigned char lo = sshboot_hex_val(encoded[i + 1]);
+        if (hi > 15 || lo > 15) return -1;
+        out[pos++] = (char)(((hi << 4) | lo) ^ sshboot_keystream_next(&state));
+    }
+    out[pos] = '\0';
+    return 0;
+}
+
+static void terminal_apply_sshboot_line(struct Window *w, const char *line) {
+    char buf[COLS];
+    char tmp[OUT_BUF_SIZE];
+    char *p;
+    char *eq;
+    int n = 0;
+
+    (void)w;
+    if (!line) return;
+    while (*line == ' ' || *line == '\t') line++;
+    if (*line == '\0' || *line == '#') return;
+    while (line[n] && n < (int)sizeof(buf) - 1) {
+        buf[n] = line[n];
+        n++;
+    }
+    buf[n] = '\0';
+    while (n > 0 && (buf[n - 1] == '\r' || buf[n - 1] == '\n' || buf[n - 1] == ' ' || buf[n - 1] == '\t')) {
+        buf[--n] = '\0';
+    }
+    if (buf[0] == '\0') return;
+
+    tmp[0] = '\0';
+    if (strncmp(buf, "ssh set ", 8) == 0) {
+        p = buf + 8;
+        while (*p == ' ') p++;
+        ssh_client_set_target(p, tmp, sizeof(tmp));
+        return;
+    }
+    if (strncmp(buf, "ssh auth ", 9) == 0) {
+        p = buf + 9;
+        while (*p == ' ') p++;
+        ssh_client_set_password(p, tmp, sizeof(tmp));
+        return;
+    }
+    if (strncmp(buf, "sftp mount ", 11) == 0) {
+        p = buf + 11;
+        while (*p == ' ') p++;
+        ssh_client_sftp_mount(*p ? p : ".", tmp, sizeof(tmp));
+        return;
+    }
+    if (strncmp(buf, "wrp set ", 8) == 0) {
+        p = buf + 8;
+        while (*p == ' ') p++;
+        ssh_client_set_wrp_url(p, tmp, sizeof(tmp));
+        return;
+    }
+
+    eq = strchr(buf, '=');
+    if (!eq) return;
+    *eq++ = '\0';
+    p = eq;
+    while (*p == ' ' || *p == '\t') p++;
+    if (strcmp(buf, "target") == 0 || strcmp(buf, "ssh") == 0) {
+        ssh_client_set_target(p, tmp, sizeof(tmp));
+    } else if (strcmp(buf, "password") == 0 || strcmp(buf, "auth") == 0) {
+        ssh_client_set_password(p, tmp, sizeof(tmp));
+    } else if (strcmp(buf, "password_obf") == 0 || strcmp(buf, "auth_obf") == 0) {
+        char plain[64];
+        if (sshboot_password_deobfuscate(p, plain, sizeof(plain)) == 0) {
+            ssh_client_set_password(plain, tmp, sizeof(tmp));
+            memset(plain, 0, sizeof(plain));
+        }
+    } else if (strcmp(buf, "sftp") == 0 || strcmp(buf, "sftp_root") == 0) {
+        ssh_client_sftp_mount(*p ? p : ".", tmp, sizeof(tmp));
+    } else if (strcmp(buf, "wrp") == 0) {
+        ssh_client_set_wrp_url(p, tmp, sizeof(tmp));
+    }
+}
+
+static void terminal_load_sshboot(struct Window *w) {
+    unsigned char *buf = 0;
+    uint32_t size = 0;
+    if (!w || w->kind != WINDOW_KIND_TERMINAL) return;
+    if (load_file_bytes_alloc(w, "~/.sshboot", &buf, &size) != 0 || !buf) {
+        const char *example =
+            "# optional ssh auto-login config\n"
+            "# copy this file to ~/.sshboot and edit the password locally\n"
+            "# or run: ssh boot seal <password>\n"
+            "# target=root@192.168.123.100:2221\n"
+            "# password=your-password\n"
+            "# password_obf=v1:...\n"
+            "# sftp=/root/trade_new/os/mini-riscv-os/08-BlockDeviceDriver/http_test\n";
+        store_file_bytes(w, "~/.sshboot.example", (const unsigned char *)example, (uint32_t)strlen(example));
+        if (buf) free(buf);
+        return;
+    }
+    {
+        uint32_t i = 0;
+        uint32_t start = 0;
+        while (i <= size) {
+            if (i == size || buf[i] == '\n') {
+                char line[COLS];
+                uint32_t len = i - start;
+                if (len >= sizeof(line)) len = sizeof(line) - 1;
+                memcpy(line, buf + start, len);
+                line[len] = '\0';
+                terminal_apply_sshboot_line(w, line);
+                start = i + 1;
+            }
+            i++;
+        }
+    }
+    free(buf);
+}
+
 static void terminal_load_bashrc(struct Window *w) {
     unsigned char *probe_buf = 0;
     uint32_t probe_size = 0;
@@ -749,6 +961,7 @@ static void terminal_load_bashrc(struct Window *w) {
         store_file_bytes(w, "~/.bashrc", (const unsigned char *)def, (uint32_t)strlen(def));
     }
     terminal_source_script(w, "~/.bashrc");
+    terminal_load_sshboot(w);
 }
 
 static int terminal_env_find(struct Window *w, const char *name) {
@@ -1093,6 +1306,10 @@ static void broadcast_ctrl_c(void) {
         if (!wins[i].active || wins[i].kind != WINDOW_KIND_TERMINAL) continue;
         if (wins[i].executing_cmd || wins[i].waiting_wget) {
             wins[i].cancel_requested = 1;
+            int worker = i % TERMINAL_WORKERS;
+            if (worker >= 0 && worker < TERMINAL_WORKERS && terminal_worker_task_ids[worker] >= 0) {
+                os_jit_cancel_task(terminal_worker_task_ids[worker]);
+            }
         }
     }
 }
@@ -1298,6 +1515,25 @@ static void append_dir_entries_sorted(struct dir_block *db, const char *title, c
         }
     }
     if (!printed) lib_strcat(out, " (empty)");
+}
+
+static void append_virtual_mount_entries(int show, int all, char *out, int *printed) {
+    char row[128];
+    if (!show || !out) return;
+    if (all) {
+        row[0] = '\0';
+        append_out_pad(row, sizeof(row), "drwx", 5); append_out_str(row, sizeof(row), " ");
+        append_out_pad(row, sizeof(row), "virt", 8); append_out_str(row, sizeof(row), " ");
+        append_out_pad(row, sizeof(row), "-", 19); append_out_str(row, sizeof(row), " ");
+        append_out_str(row, sizeof(row), "sftpd");
+    } else {
+        lib_strcpy(row, "d sftpd");
+    }
+    append_out_str(row, sizeof(row), "\n");
+    if (strlen(out) + strlen(row) < OUT_BUF_SIZE - 2) {
+        lib_strcat(out, row);
+        if (printed) *printed = 1;
+    }
 }
 
 static void append_single_entry_line(struct file_entry *e, char *out, int all) {
@@ -1630,6 +1866,7 @@ static int is_name_completion_cmd(const char *cmd) {
            strcmp(cmd, "unalias") == 0 ||
            strcmp(cmd, "source") == 0 ||
            strcmp(cmd, "run") == 0 ||
+           strcmp(cmd, "jit") == 0 ||
            strcmp(cmd, "ssh") == 0 ||
            strcmp(cmd, "sftp") == 0 ||
            strcmp(cmd, "wget") == 0 ||
@@ -1670,6 +1907,7 @@ static int terminal_command_uses_path_completion(const char *cmd) {
            strcmp(cmd, "write") == 0 ||
            strcmp(cmd, "open") == 0 ||
            strcmp(cmd, "run") == 0 ||
+           strcmp(cmd, "jit") == 0 ||
            strcmp(cmd, "gbemu") == 0 ||
            strcmp(cmd, "netsurf") == 0 ||
            strcmp(cmd, "source") == 0;
@@ -1699,7 +1937,7 @@ static void apply_completion(struct Window *w, int row, int token_start, int tok
 
 static int tab_complete_command(struct Window *w, int row, int token_start, int token_end) {
     static const char *cmds[] = {
-        "pwd", "format", "cd", "ls", "mkdir", "rm", "touch", "write", "cat", "wget", "open", "run", "gbemu", "demo3d", "frankenstein", "help", "clear", "mv", "rename", "netsurf", "ssh", "sftp", "wrp", "find", "mem", "df", "du", "alias", "unalias", "export", "unset", "source"
+        "pwd", "format", "cd", "ls", "mkdir", "rm", "touch", "write", "cat", "wget", "open", "run", "jit", "gbemu", "demo3d", "frankenstein", "help", "clear", "mv", "rename", "netsurf", "ssh", "sftp", "wrp", "find", "mem", "df", "du", "alias", "unalias", "export", "unset", "source"
     };
     char prefix[COLS];
     int plen = token_end - token_start;
@@ -1743,12 +1981,154 @@ static int tab_complete_command(struct Window *w, int row, int token_start, int 
     return 0;
 }
 
+static int tab_complete_sftp_name(struct Window *w, int row, int token_start, int token_end, const char *prefix) {
+    char dir_part[128];
+    char leaf_prefix[64];
+    char remote_dir[128];
+    char list_out[OUT_BUF_SIZE];
+    char best[96];
+    char common[96];
+    int matches = 0;
+
+    if (!w || !prefix) return 0;
+    if (strcmp(prefix, "/sftp") == 0 || strcmp(prefix, "/sftpd") == 0) {
+        char repl[16];
+        lib_strcpy(repl, prefix);
+        lib_strcat(repl, "/");
+        apply_completion(w, row, token_start, token_end, repl, 0);
+        return 1;
+    }
+    if (!path_is_sftp(prefix)) return 0;
+
+    {
+        const char *last_slash = strrchr(prefix, '/');
+        if (!last_slash || last_slash == prefix) {
+            lib_strcpy(dir_part, "/sftpd/");
+            leaf_prefix[0] = '\0';
+        } else {
+            int dlen = (int)(last_slash - prefix + 1);
+            if (dlen >= (int)sizeof(dir_part)) dlen = sizeof(dir_part) - 1;
+            memcpy(dir_part, prefix, dlen);
+            dir_part[dlen] = '\0';
+            lib_strcpy(leaf_prefix, last_slash + 1);
+        }
+    }
+
+    lib_strcpy(remote_dir, sftp_subpath(dir_part));
+    if (ssh_client_sftp_ls(remote_dir, list_out, sizeof(list_out)) != 0) return 0;
+    if (strcmp(list_out, "(empty)") == 0) return 0;
+
+    if (leaf_prefix[0] == '\0') {
+        char shown[OUT_BUF_SIZE];
+        shown[0] = '\0';
+        lib_strcat(shown, "SFTP possibilities:\n");
+        lib_strcat(shown, list_out);
+        append_terminal_line(w, shown);
+        terminal_append_prompt(w);
+        terminal_scroll_to_bottom(w);
+        redraw_prompt_line(w, (w->total_rows > 0) ? (w->total_rows - 1) : 0);
+        w->mailbox = 1;
+        gui_redraw_needed = 1;
+        need_resched = 1;
+        if (gui_task_id >= 0) task_wake(gui_task_id);
+        wake_terminal_worker_for_window(w->id);
+        return 1;
+    }
+
+    common[0] = '\0';
+    best[0] = '\0';
+    {
+        char *line = list_out;
+        while (*line) {
+            char type = line[0];
+            char *name = line + 2;
+            char *next = strchr(line, '\n');
+            if (next) *next = '\0';
+            if ((type == 'd' || type == 'f') && line[1] == ' ' && str_starts_with(name, leaf_prefix)) {
+                if (matches == 0) {
+                    lib_strcpy(common, name);
+                    lib_strcpy(best, name);
+                } else {
+                    int j = 0;
+                    while (common[j] && name[j] && common[j] == name[j]) j++;
+                    common[j] = '\0';
+                }
+                matches++;
+            }
+            if (!next) break;
+            *next = '\n';
+            line = next + 1;
+        }
+    }
+
+    if (matches > 1) {
+        char shown[OUT_BUF_SIZE];
+        shown[0] = '\0';
+        lib_strcat(shown, "SFTP possibilities:\n");
+        {
+            char *line = list_out;
+            while (*line) {
+                char *name = line + 2;
+                char *next = strchr(line, '\n');
+                if (next) *next = '\0';
+                if ((line[0] == 'd' || line[0] == 'f') && line[1] == ' ' && str_starts_with(name, leaf_prefix)) {
+                    lib_strcat(shown, line);
+                    lib_strcat(shown, "\n");
+                }
+                if (!next) break;
+                *next = '\n';
+                line = next + 1;
+            }
+        }
+        append_terminal_line(w, shown);
+        terminal_append_prompt(w);
+        terminal_scroll_to_bottom(w);
+        redraw_prompt_line(w, (w->total_rows > 0) ? (w->total_rows - 1) : 0);
+        w->mailbox = 1;
+        gui_redraw_needed = 1;
+        need_resched = 1;
+        if (gui_task_id >= 0) task_wake(gui_task_id);
+        wake_terminal_worker_for_window(w->id);
+        return 1;
+    }
+
+    if (matches == 1) {
+        char replacement[192];
+        int is_dir = 0;
+        char *line = list_out;
+        while (*line) {
+            char *name = line + 2;
+            char *next = strchr(line, '\n');
+            if (next) *next = '\0';
+            if ((line[0] == 'd' || line[0] == 'f') && line[1] == ' ' && strcmp(name, best) == 0) {
+                is_dir = (line[0] == 'd');
+                if (next) *next = '\n';
+                break;
+            }
+            if (!next) break;
+            *next = '\n';
+            line = next + 1;
+        }
+        lib_strcpy(replacement, dir_part);
+        lib_strcat(replacement, best);
+        if (is_dir) lib_strcat(replacement, "/");
+        apply_completion(w, row, token_start, token_end, replacement, 0);
+        return 1;
+    }
+
+    return 0;
+}
+
 static int tab_complete_name(struct Window *w, int row, int token_start, int token_end, int type_filter) {
     char prefix[COLS];
     int plen = token_end - token_start;
     if (plen < 0) plen = 0; if (plen >= COLS) plen = COLS - 1;
     for (int i = 0; i < plen; i++) prefix[i] = w->cmd_buf[token_start + i];
     prefix[plen] = '\0';
+
+    if (path_is_sftp(prefix) || strcmp(prefix, "/sftp") == 0 || strcmp(prefix, "/sftpd") == 0) {
+        if (tab_complete_sftp_name(w, row, token_start, token_end, prefix)) return 1;
+    }
 
     uint32_t target_dir_bno = w->cwd_bno;
     char leaf_prefix[32]; leaf_prefix[0] = '\0';
@@ -1814,6 +2194,17 @@ static int tab_complete_name(struct Window *w, int row, int token_start, int tok
             matches++;
         }
     }
+    if (target_dir_bno == 1 && (type_filter == -1 || type_filter == 1) && str_starts_with("sftpd", leaf_prefix)) {
+        if (matches == 0) {
+            lib_strcpy(common, "sftpd");
+            lib_strcpy(best, "sftpd");
+        } else {
+            int j = 0;
+            while (common[j] && "sftpd"[j] && common[j] == "sftpd"[j]) j++;
+            common[j] = '\0';
+        }
+        matches++;
+    }
     
     if (matches > 1) {
         char list_out[OUT_BUF_SIZE]; list_out[0] = '\0';
@@ -1841,7 +2232,7 @@ static int tab_complete_name(struct Window *w, int row, int token_start, int tok
         lib_strcat(full_replacement, best);
         int idx = find_entry_index(db, (char *)best, 1);
         // Add slash if it's a directory to allow immediate recursion on next Tab
-        if (idx >= 0) lib_strcat(full_replacement, "/");
+        if (idx >= 0 || (target_dir_bno == 1 && strcmp(best, "sftpd") == 0)) lib_strcat(full_replacement, "/");
         apply_completion(w, row, token_start, token_end, full_replacement, 0);
         return 1;
     }
@@ -2701,6 +3092,13 @@ static void list_dir_contents(uint32_t bno, char *out) {
     if (!db) { lib_strcpy(out, "ERR: Directory unreadable."); return; }
 
     append_dir_entries_sorted(db, "Directory contents:\n", 0, -1, out);
+    if (bno == 1) {
+        int printed = 0;
+        if (strcmp(out, "Directory contents:\n (empty)") == 0) {
+            lib_strcpy(out, "Directory contents:\n");
+        }
+        append_virtual_mount_entries(bno == 1, 0, out, &printed);
+    }
 }
 
 static int check_dir_and_list(struct Window *w, const char *path, char *out) {
@@ -2723,15 +3121,27 @@ static int check_dir_and_list(struct Window *w, const char *path, char *out) {
 }
 
 extern void os_jit_run(const char *source);
+extern int os_jit_run_bg(const char *source, int owner_win_id, char *msg, size_t msg_size);
+extern void os_jit_ps(char *out, size_t out_size);
+extern int os_jit_kill(int id, char *msg, size_t msg_size);
+extern int os_jit_cancel_task(int task_id);
+extern void os_jit_shared_reset(void);
+extern void os_jit_init(void);
 
 static int path_is_sftp(const char *path) {
-    return path && strncmp(path, "/sftp", 5) == 0 &&
-           (path[5] == '\0' || path[5] == '/');
+    return path &&
+           ((strncmp(path, "/sftp", 5) == 0 && (path[5] == '\0' || path[5] == '/')) ||
+            (strncmp(path, "/sftpd", 6) == 0 && (path[6] == '\0' || path[6] == '/')) ||
+            (strncmp(path, "sftp", 4) == 0 && (path[4] == '\0' || path[4] == '/')) ||
+            (strncmp(path, "sftpd", 5) == 0 && (path[5] == '\0' || path[5] == '/')));
 }
 
 static const char *sftp_subpath(const char *path) {
     if (!path_is_sftp(path)) return path;
-    path += 5;
+    if (strncmp(path, "/sftpd", 6) == 0) path += 6;
+    else if (strncmp(path, "/sftp", 5) == 0) path += 5;
+    else if (strncmp(path, "sftpd", 5) == 0) path += 5;
+    else path += 4;
     if (*path == '/') path++;
     return *path ? path : ".";
 }
@@ -2912,17 +3322,50 @@ static void exec_mem_cmd(char *out, char *arg) {
 void exec_single_cmd(struct Window *w, char *cmd) {
     char *out = w->out_buf; out[0] = '\0';
     if (strncmp(cmd, "jit", 3) == 0 && (cmd[3] == ' ' || cmd[3] == '\0')) {
+        int bg = 0;
         char *arg = cmd + 3; while (*arg == ' ') arg++;
+        if (strncmp(arg, "ps", 2) == 0 && (arg[2] == '\0' || arg[2] == ' ')) {
+            os_jit_ps(out, OUT_BUF_SIZE);
+            return;
+        }
+        if (strncmp(arg, "kill", 4) == 0 && (arg[4] == '\0' || arg[4] == ' ')) {
+            arg += 4;
+            while (*arg == ' ') arg++;
+            if (*arg == '\0') {
+                lib_strcpy(out, "usage: jit kill <id>");
+                return;
+            }
+            os_jit_kill(atoi(arg), out, OUT_BUF_SIZE);
+            return;
+        }
+        if (strncmp(arg, "shared reset", 12) == 0 && (arg[12] == '\0' || arg[12] == ' ')) {
+            os_jit_shared_reset();
+            lib_strcpy(out, "JIT shared memory reset.");
+            return;
+        }
+        if ((*arg == 'h' && (arg[1] == '\0' || arg[1] == ' ')) || strncmp(arg, "-h", 2) == 0) {
+            lib_strcpy(out, "usage: jit [bg] \"source\" | jit [bg] file.c | jit ps | jit kill <id> | jit shared reset");
+            return;
+        }
+        if (strncmp(arg, "bg", 2) == 0 && (arg[2] == '\0' || arg[2] == ' ')) {
+            bg = 1;
+            arg += 2;
+            while (*arg == ' ') arg++;
+        }
         if (*arg == '\0') {
-            lib_strcpy(out, "usage: jit \"source code\" OR jit file.c");
+            lib_strcpy(out, "usage: jit [bg] \"source\" | jit [bg] file.c | jit ps | jit kill <id> | jit shared reset");
             return;
         }
         if (arg[0] == '"') {
             char *source = arg + 1;
             char *end = strrchr(source, '"');
             if (end) *end = '\0';
-            os_jit_run(source);
-            lib_strcpy(out, "JIT execution finished.");
+            if (bg) {
+                os_jit_run_bg(source, w->id, out, OUT_BUF_SIZE);
+            } else {
+                os_jit_run(source);
+                lib_strcpy(out, "JIT execution finished.");
+            }
         } else {
             uint32_t size = 0;
             if (path_is_sftp(arg)) {
@@ -2938,16 +3381,20 @@ void exec_single_cmd(struct Window *w, char *cmd) {
                     memcpy(src, remote_buf, size);
                     src[size] = '\0';
                     free(remote_buf);
-                    os_jit_run(src);
+                    if (bg) os_jit_run_bg(src, w->id, out, OUT_BUF_SIZE);
+                    else os_jit_run(src);
                     free(src);
-                    lib_strcpy(out, "JIT SFTP file execution finished.");
+                    if (!bg) lib_strcpy(out, "JIT SFTP file execution finished.");
                 } else {
                     lib_strcpy(out, msg[0] ? msg : "ERR: Could not read SFTP file.");
                 }
             } else if (load_file_bytes(w, arg, file_io_buf, WGET_MAX_FILE_SIZE, &size) == 0) {
                 file_io_buf[size] = '\0';
-                os_jit_run((const char *)file_io_buf);
-                lib_strcpy(out, "JIT file execution finished.");
+                if (bg) os_jit_run_bg((const char *)file_io_buf, w->id, out, OUT_BUF_SIZE);
+                else {
+                    os_jit_run((const char *)file_io_buf);
+                    lib_strcpy(out, "JIT file execution finished.");
+                }
             } else {
                 lib_strcpy(out, "ERR: Could not read file.");
             }
@@ -3212,6 +3659,7 @@ void exec_single_cmd(struct Window *w, char *cmd) {
             }
         }
         uint32_t target_bno = w->cwd_bno;
+        int show_virtual_mounts = 0;
         char single_out[OUT_BUF_SIZE];
         single_out[0] = '\0';
         if (*path_arg != '\0' && strcmp(path_arg, "-all") != 0) {
@@ -3239,6 +3687,11 @@ void exec_single_cmd(struct Window *w, char *cmd) {
                     }
                 }
             } else { lib_strcpy(out, "ERR: Invalid Path."); return; }
+            if (strcmp(path_arg, "/") == 0 || strcmp(path_arg, "/root") == 0 || strcmp(path_arg, "~") == 0) {
+                show_virtual_mounts = 1;
+            }
+        } else if (target_bno == 1 || strcmp(w->cwd, "/root") == 0 || strcmp(w->cwd, "/") == 0) {
+            show_virtual_mounts = 1;
         }
         extern struct Window fs_tmp_window; struct Window *ctx = &fs_tmp_window;
         memset(ctx, 0, sizeof(*ctx)); ctx->cwd_bno = target_bno;
@@ -3265,6 +3718,7 @@ void exec_single_cmd(struct Window *w, char *cmd) {
             append_out_str(out, OUT_BUF_SIZE, "\n");
             printed = 1;
         }
+        append_virtual_mount_entries(show_virtual_mounts || target_bno == 1, all, out, &printed);
         if (!printed) lib_strcpy(out, "(empty)");
     } else if (strncmp(cmd, "sftp", 4) == 0 && (cmd[4] == '\0' || cmd[4] == ' ')) {
         char *arg = cmd + 4;
@@ -3312,7 +3766,7 @@ void exec_single_cmd(struct Window *w, char *cmd) {
         char *arg = cmd + 3;
         while (*arg == ' ') arg++;
         if (*arg == 'h' && (*(arg+1) == '\0' || *(arg+1) == ' ')) {
-            lib_strcpy(out, "usage: ssh status | ssh set <user@host[:port]> | ssh auth [password] | ssh exec <cmd>");
+            lib_strcpy(out, "usage: ssh status | ssh set <user@host[:port]> | ssh auth [password] | ssh boot init|seal|apply | ssh exec <cmd>");
             return;
         }
         if (*arg == '\0' || strcmp(arg, "status") == 0) {
@@ -3347,6 +3801,58 @@ void exec_single_cmd(struct Window *w, char *cmd) {
             if (ssh_client_set_password(password, out, OUT_BUF_SIZE) < 0 && out[0] == '\0') {
                 lib_strcpy(out, "ERR: ssh auth <password>.");
             }
+        } else if (strncmp(arg, "boot", 4) == 0 && (arg[4] == '\0' || arg[4] == ' ')) {
+            char *sub = arg + 4;
+            while (*sub == ' ') sub++;
+            if (strcmp(sub, "init") == 0 || *sub == '\0') {
+                const char *tmpl =
+                    "# ssh auto-login boot config\n"
+                    "# run: ssh boot seal <password>\n"
+                    "target=root@192.168.123.100:2221\n"
+                    "# password=your-password\n"
+                    "# password_obf=v1:...\n"
+                    "sftp=/root/trade_new/os/mini-riscv-os/08-BlockDeviceDriver/http_test\n";
+                if (store_file_bytes(w, "~/.sshboot", (const unsigned char *)tmpl, (uint32_t)strlen(tmpl)) == 0) {
+                    lib_strcpy(out, "OK: wrote ~/.sshboot. Run: ssh boot seal <password>");
+                } else {
+                    lib_strcpy(out, "ERR: cannot write ~/.sshboot.");
+                }
+            } else if (strncmp(sub, "seal ", 5) == 0) {
+                char *password = sub + 5;
+                char enc[160];
+                char target[96];
+                char tmpl[512];
+                while (*password == ' ') password++;
+                if (*password == '\0') {
+                    lib_strcpy(out, "usage: ssh boot seal <password>");
+                    return;
+                }
+                if (sshboot_password_obfuscate(password, enc, sizeof(enc)) != 0) {
+                    lib_strcpy(out, "ERR: password too long.");
+                    return;
+                }
+                if (ssh_client_get_target(target, sizeof(target)) != 0 || target[0] == '\0') {
+                    lib_strcpy(target, "root@192.168.123.100:2221");
+                }
+                snprintf(tmpl, sizeof(tmpl),
+                         "# ssh auto-login boot config\n"
+                         "# password_obf is obfuscated, not strong encryption\n"
+                         "target=%s\n"
+                         "password_obf=%s\n"
+                         "sftp=/root/trade_new/os/mini-riscv-os/08-BlockDeviceDriver/http_test\n",
+                         target, enc);
+                if (store_file_bytes(w, "~/.sshboot", (const unsigned char *)tmpl, (uint32_t)strlen(tmpl)) == 0) {
+                    terminal_load_sshboot(w);
+                    lib_strcpy(out, "OK: wrote obfuscated ~/.sshboot and loaded it.");
+                } else {
+                    lib_strcpy(out, "ERR: cannot write ~/.sshboot.");
+                }
+            } else if (strcmp(sub, "apply") == 0) {
+                terminal_load_sshboot(w);
+                lib_strcpy(out, "OK: loaded ~/.sshboot.");
+            } else {
+                lib_strcpy(out, "usage: ssh boot init | ssh boot seal <password> | ssh boot apply");
+            }
         } else if (strncmp(arg, "exec ", 5) == 0) {
             char *remote = arg + 5;
             while (*remote == ' ') remote++;
@@ -3356,7 +3862,7 @@ void exec_single_cmd(struct Window *w, char *cmd) {
                 ssh_client_exec_remote(remote, out, OUT_BUF_SIZE);
             }
         } else {
-            lib_strcpy(out, "ERR: ssh status | ssh set <user@host[:port]> | ssh auth [password] | ssh exec <cmd>");
+            lib_strcpy(out, "ERR: ssh status | ssh set <user@host[:port]> | ssh auth [password] | ssh boot init|seal|apply | ssh exec <cmd>");
         }
     } else if (strncmp(cmd, "wrp", 3) == 0 && (cmd[3] == '\0' || cmd[3] == ' ')) {
         char *arg = cmd + 3;
@@ -3749,7 +4255,7 @@ void exec_single_cmd(struct Window *w, char *cmd) {
     } else if (strncmp(cmd, "mem", 3) == 0 && (cmd[3] == '\0' || cmd[3] == ' ')) {
         exec_mem_cmd(out, cmd + 3);
     } else if (strncmp(cmd, "help", 4) == 0) {
-        lib_strcpy(out, "Commands: ls, find, mem, df, du, mkdir, rm, mv, touch, cd, pwd, write, cat, wget, open, run, gbemu, vim, asm, demo3d, frankenstein, netsurf, ssh, sftp, wrp, format, clear, env, export, unset, alias, unalias, source, ., echo\nType '<cmd> h' for usage.");
+        lib_strcpy(out, "Commands: ls, find, mem, df, du, mkdir, rm, mv, touch, cd, pwd, write, cat, wget, open, run, jit, gbemu, vim, asm, demo3d, frankenstein, netsurf, ssh, sftp, wrp, format, clear, env, export, unset, alias, unalias, source, ., echo\nType '<cmd> h' for usage.");
     } else { lib_strcpy(out, "Invalid signal."); }
 }
 void run_command(struct Window *w) {
@@ -3764,6 +4270,19 @@ void run_command(struct Window *w) {
 
     w->executing_cmd = 1;
     w->cancel_requested = 0;
+
+    if (terminal_is_ssh_auth_request(full_cmd)) {
+        w->executing_cmd = 0;
+        w->submit_locked = 0;
+        terminal_begin_ssh_auth(w);
+        return;
+    }
+    if (terminal_is_ssh_boot_seal_request(full_cmd)) {
+        w->executing_cmd = 0;
+        w->submit_locked = 0;
+        terminal_begin_ssh_boot_seal(w);
+        return;
+    }
 
     // 指令紀錄與清除處理
     if (w->edit_len > 0) {
@@ -3915,6 +4434,10 @@ static void handle_window_mailbox(struct Window *w) {
         if (had_input) {
             if (terminal_is_ssh_auth_request(w->cmd_buf)) {
                 terminal_begin_ssh_auth(w);
+                return;
+            }
+            if (terminal_is_ssh_boot_seal_request(w->cmd_buf)) {
+                terminal_begin_ssh_boot_seal(w);
                 return;
             }
             w->submit_locked = 1;
@@ -4684,7 +5207,7 @@ void gui_task(void) {
             if (key_consumed) {
                 gui_key = 0;
             } else if (gui_key == 3 && wins[active_win_idx].kind == WINDOW_KIND_TERMINAL) {
-                if (wins[active_win_idx].has_selection) {
+                if (wins[active_win_idx].has_selection && wins[active_win_idx].edit_len == 0) {
                     terminal_copy_selection(&wins[active_win_idx]);
                 } else if (wins[active_win_idx].executing_cmd || wins[active_win_idx].waiting_wget) {
                     broadcast_ctrl_c();
@@ -4936,6 +5459,7 @@ void network_task(void) {
     }
 }
 void user_init() {
+    os_jit_init();
     for (int i = 0; i < TERMINAL_WORKERS; i++) terminal_worker_task_ids[i] = -1;
     gui_task_id = task_create(&gui_task, 0, 1);
     for(int i=0; i<TERMINAL_WORKERS; i++) terminal_worker_task_ids[i] = task_create(&terminal_worker_task, 0, 1);

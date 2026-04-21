@@ -7,6 +7,14 @@
 #include "psa/crypto.h"
 #include <stdarg.h>
 
+#ifndef SSH_DEBUG_LOG
+#define SSH_DEBUG_LOG 0
+#endif
+
+#if !SSH_DEBUG_LOG
+#define lib_printf(...) do { } while (0)
+#endif
+
 static void *mbedtls_os_calloc(size_t n, size_t size)
 {
     size_t total = n * size;

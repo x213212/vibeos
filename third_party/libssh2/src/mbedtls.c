@@ -47,6 +47,14 @@
 
 extern int lib_printf(const char *fmt, ...);
 
+#ifndef SSH_DEBUG_LOG
+#define SSH_DEBUG_LOG 0
+#endif
+
+#if !SSH_DEBUG_LOG
+#define lib_printf(...) do { } while (0)
+#endif
+
 #if MBEDTLS_VERSION_NUMBER < 0x03010000
 #error "mbedTLS 3.1.0 or upper required"
 #endif

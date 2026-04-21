@@ -42,6 +42,14 @@
 
 extern int lib_printf(const char *fmt, ...);
 
+#ifndef SSH_DEBUG_LOG
+#define SSH_DEBUG_LOG 0
+#endif
+
+#if !SSH_DEBUG_LOG
+#define lib_printf(...) do { } while (0)
+#endif
+
 #if defined(LIBSSH2DEBUG) && defined(LIBSSH2_MAC_NONE_INSECURE)
 /* mac_none_MAC
  *

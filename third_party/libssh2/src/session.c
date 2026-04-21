@@ -41,6 +41,14 @@
 
 #include "libssh2_priv.h"
 
+#ifndef SSH_DEBUG_LOG
+#define SSH_DEBUG_LOG 0
+#endif
+
+#if !SSH_DEBUG_LOG
+#define lib_printf(...) do { } while (0)
+#endif
+
 extern FILE *stderr;
 
 #ifdef _WIN32

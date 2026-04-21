@@ -48,6 +48,14 @@
 
 extern int lib_printf(const char *fmt, ...);
 
+#ifndef SSH_DEBUG_LOG
+#define SSH_DEBUG_LOG 0
+#endif
+
+#if !SSH_DEBUG_LOG
+#define lib_printf(...) do { } while (0)
+#endif
+
 /* define SHA1_DIGEST_LENGTH for the macro below */
 #ifndef SHA1_DIGEST_LENGTH
 #define SHA1_DIGEST_LENGTH SHA_DIGEST_LENGTH

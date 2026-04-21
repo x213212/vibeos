@@ -43,6 +43,14 @@
 
 #include <assert.h>
 
+#ifndef SSH_DEBUG_LOG
+#define SSH_DEBUG_LOG 0
+#endif
+
+#if !SSH_DEBUG_LOG
+#define lib_printf(...) do { } while (0)
+#endif
+
 #if defined(LIBSSH2DEBUG) && defined(LIBSSH2_CRYPT_NONE_INSECURE)
 /* crypt_none_crypt
  * Minimalist cipher: no encryption. DO NOT USE.

@@ -38,6 +38,15 @@
 #include <string.h>
 #include "mbedtls/platform.h"
 
+#ifndef SSH_DEBUG_LOG
+#define SSH_DEBUG_LOG 0
+#endif
+
+#if !SSH_DEBUG_LOG
+#undef mbedtls_printf
+#define mbedtls_printf(...) do { } while (0)
+#endif
+
 #include "mbedtls/private/aes.h"
 #include "mbedtls/asn1.h"
 #include "mbedtls/asn1write.h"
