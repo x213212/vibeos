@@ -483,6 +483,14 @@ void editor_handle_key(struct Window *w, char key) {
         editor_page_up(w);
     } else if (key == 0x18) { // PageDown in Insert Mode
         editor_page_down(w);
+    } else if (key == 0x10) { // Up in Insert Mode
+        editor_move_up(w);
+    } else if (key == 0x11) { // Down in Insert Mode
+        editor_move_down(w);
+    } else if (key == 0x12) { // Left in Insert Mode
+        editor_move_left(w);
+    } else if (key == 0x13) { // Right in Insert Mode
+        editor_move_right(w);
     } else if (key == 8 || key == 127) {
         if (w->editor_cursor_col > 0) {
             editor_move_left(w);

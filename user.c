@@ -2105,8 +2105,9 @@ int open_text_editor(struct Window *term, const char *name) {
         wins[i].cwd_bno = dir_bno ? dir_bno : (term->cwd_bno ? term->cwd_bno : 1);
         if (rc == 0) editor_load_bytes(&wins[i], file_io_buf, size);
         else editor_clear(&wins[i]);
-        lib_strcpy(wins[i].editor_path, absolute_path);
+        copy_name20(wins[i].editor_path, absolute_path);
         if (wins[i].editor_path[0] == '\0') build_editor_path(wins[i].editor_path, wins[i].editor_cwd, wins[i].editor_name);
+        memset(wins[i].title, 0, sizeof(wins[i].title));
         lib_strcpy(wins[i].title, "Vim: ");
         shorten_path_for_title(wins[i].title + 5, wins[i].editor_path, 18);
         editor_set_status(&wins[i], "i=insert  :wq=save+quit  :q=quit");
