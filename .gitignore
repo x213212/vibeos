@@ -1,0 +1,10 @@
+*.o
+*.elf
+*.dsk
+*.bin
+wrp/wrp
+wrp/go-build/
+.gdb_history
+/tmp/mbedtls-rv-build/
+**/.*.swp
+**/.*.swo
