@@ -126,14 +126,15 @@ static void build_editor_path(char *dst, const char *cwd, const char *name) {
 }
 
 static void shorten_path_for_title(char *dst, const char *src, int max_len) {
-    int len = 0;
     int src_len = 0;
     if (!dst || max_len <= 0) return;
     dst[0] = '\0';
     if (!src) return;
     while (src[src_len]) src_len++;
     if (src_len <= max_len) {
-        copy_name20(dst, src);
+        int i = 0;
+        for (; i < max_len && src[i]; i++) dst[i] = src[i];
+        dst[i] = '\0';
         return;
     }
     if (max_len <= 3) {
@@ -2103,10 +2104,10 @@ int open_text_editor(struct Window *term, const char *name) {
         wins[i].cwd_bno = dir_bno ? dir_bno : (term->cwd_bno ? term->cwd_bno : 1);
         if (rc == 0) editor_load_bytes(&wins[i], file_io_buf, size);
         else editor_clear(&wins[i]);
-        copy_name20(wins[i].editor_path, absolute_path);
+        lib_strcpy(wins[i].editor_path, absolute_path);
         if (wins[i].editor_path[0] == '\0') build_editor_path(wins[i].editor_path, wins[i].editor_cwd, wins[i].editor_name);
         lib_strcpy(wins[i].title, "Vim: ");
-        shorten_path_for_title(wins[i].title + 5, wins[i].editor_path, 17);
+        shorten_path_for_title(wins[i].title + 5, wins[i].editor_path, 18);
         editor_set_status(&wins[i], "i=insert  :wq=save+quit  :q=quit");
         bring_to_front(i);
         return 0;
@@ -3151,48 +3152,59 @@ void exec_single_cmd(struct Window *w, char *cmd) {
         lib_strcpy(out, "Commands: ls, find, mem, df, du, mkdir, rm, touch, cd, pwd, write, cat, wget, open, run, gbemu, vim, asm, demo3d, frankenstein, netsurf, ssh, wrp, format, clear, env, export, unset, alias, unalias, source, ., echo\nType '<cmd> h' for usage.");
     } else { lib_strcpy(out, "Invalid signal."); }
 }
-
 void run_command(struct Window *w) {
     char *full_cmd = w->cmd_buf;
-    char alias_cmd[COLS];
-    char expanded_cmd[COLS];
-    const char *cmd;
     w->shell_status[0] = '\0';
-    if (w->total_rows >= ROWS - 2) { w->total_rows = 1; w->v_offset = 0; }
-    terminal_expand_alias_command(w, full_cmd, alias_cmd, sizeof(alias_cmd));
-    terminal_env_expand_command(w, alias_cmd, expanded_cmd, sizeof(expanded_cmd));
-    cmd = expanded_cmd;
-    if (strlen(full_cmd) > 0) {
-        w->executing_cmd = 1;
-        w->cancel_requested = 0;
+
+    // 捲動邏輯：滿了就往上推，而不是直接清空
+    if (w->total_rows >= ROWS) {
+        for (int i = 1; i < ROWS; i++) lib_strcpy(w->lines[i-1], w->lines[i]);
+        w->total_rows = ROWS - 1;
+    }
+
+    w->executing_cmd = 1;
+    w->cancel_requested = 0;
+
+    // 指令紀錄與清除處理
+    if (w->edit_len > 0) {
         if (w->hist_count == 0 || strcmp(w->history[0], full_cmd) != 0) {
             for(int i=MAX_HIST-1; i>0; i--) lib_strcpy(w->history[i], w->history[i-1]);
-            lib_strcpy(w->history[0], full_cmd); if(w->hist_count < MAX_HIST) w->hist_count++;
+            lib_strcpy(w->history[0], full_cmd); 
+            if(w->hist_count < MAX_HIST) w->hist_count++;
         }
     }
-    w->hist_idx = -1;
-    if (strncmp(cmd, "clear", 5) == 0) {
-        w->total_rows = 1; w->v_offset = 0; lib_strcpy(w->lines[0], "matrix:~$ > "); w->cur_col = 12;
-        w->executing_cmd = 0; w->cancel_requested = 0;
+    if (strncmp(full_cmd, "clear", 5) == 0) {
+        w->total_rows = 1; w->v_offset = 0; 
+        lib_strcpy(w->lines[0], PROMPT); w->cur_col = PROMPT_LEN;
+        w->executing_cmd = 0; w->submit_locked = 0;
         return;
     }
-    int follow_bottom = terminal_is_at_bottom(w);
-    exec_single_cmd(w, (char *)cmd);
-    char *res = w->out_buf; int len = strlen(res), pos = 0, mc = w->maximized ? 65 : (w->w/8-3);
+
+    // 執行指令
+    exec_single_cmd(w, full_cmd);
+
+    // 安全地將輸出印到螢幕 (嚴格邊界檢查)
+    char *res = w->out_buf;
+    int len = strlen(res);
+    int pos = 0;
+    int max_c = terminal_visible_cols(w);
+
     while(pos < len && w->total_rows < ROWS) {
-        int t = 0; while(pos+t < len && res[pos+t] != '\n' && t < mc) t++;
-        for(int i=0; i<t; i++) if(w->total_rows < ROWS) w->lines[w->total_rows][i] = res[pos+i];
-        if(w->total_rows < ROWS) { w->lines[w->total_rows][t] = '\0'; w->total_rows++; }
-        if (res[pos+t] == '\n') pos += (t + 1); else pos += t;
+        int t = 0;
+        while(pos+t < len && res[pos+t] != '\n' && t < max_c) t++;
+        
+        if (w->total_rows < ROWS) {
+            for(int i=0; i<t; i++) w->lines[w->total_rows][i] = res[pos+i];
+            w->lines[w->total_rows][t] = '\0';
+            w->total_rows++;
+        }
+        pos += (pos + t < len && res[pos+t] == '\n') ? (t + 1) : t;
     }
-    if (w->total_rows >= ROWS) {
-        w->total_rows = ROWS - 1;
-        if (w->v_offset > 0) w->v_offset--;
-    }
-    if (follow_bottom) terminal_scroll_to_bottom(w);
-    if (!(strncmp(full_cmd, "run ", 4) == 0 && app_running)) {
-        w->executing_cmd = 0;
-        w->cancel_requested = 0;
+
+    terminal_scroll_to_bottom(w);
+    if (!app_running) { 
+        w->executing_cmd = 0; 
+        w->submit_locked = 0; 
     }
 }
 
@@ -3202,6 +3214,16 @@ static void handle_window_mailbox(struct Window *w) {
         w->mailbox = 0;
         return;
     }
+
+    // SANITY CHECK: Fix the '1.6 billion' memory corruption bug
+    if (w->edit_len < 0 || w->edit_len >= COLS) {
+        lib_printf("[FIX] Detected corrupted edit_len=%d, resetting to 0\n", w->edit_len);
+        w->edit_len = 0;
+        w->cursor_pos = 0;
+        w->cmd_buf[0] = '\0';
+    }
+
+    // DEBUG LOGGING
     if (w->kind == WINDOW_KIND_EDITOR) {
         editor_handle_key(w, key);
         return;
@@ -3274,17 +3296,24 @@ static void handle_window_mailbox(struct Window *w) {
     if (key == 10) {
         if (w->waiting_wget) return;
         if (w->submit_locked) return;
+
+        int q_len = (w->input_tail >= w->input_head) ? 
+                    (w->input_tail - w->input_head) : 
+                    (INPUT_MAILBOX_SIZE - w->input_head + w->input_tail);
+        lib_printf("[DEBUG] Enter logic START, Q_len=%d, edit_len=%d\n", q_len, w->edit_len);
+
         int is_clear = (strncmp(w->cmd_buf, "clear", 5) == 0);
-        if (w->edit_len > 0) {
+        int had_input = (w->edit_len > 0);
+        
+        if (had_input) {
             if (terminal_is_ssh_auth_request(w->cmd_buf)) {
                 terminal_begin_ssh_auth(w);
-                w->input_head = w->input_tail;
                 return;
             }
             w->submit_locked = 1;
             run_command(w);
         }
-        w->input_head = w->input_tail;
+        
         if (w->waiting_wget) return;
         clear_prompt_input(w);
         if (!is_clear && !app_running && w->total_rows < ROWS) {
@@ -3363,6 +3392,7 @@ static void handle_window_mailbox(struct Window *w) {
         try_tab_complete(w, r);
     } else if (key >= 32) {
         if (w->edit_len < COLS - PROMPT_LEN - 1) {
+            lib_printf("[DEBUG] Storing char '%c'\n", key);
             for (int i = w->edit_len; i >= w->cursor_pos; i--) {
                 w->cmd_buf[i + 1] = w->cmd_buf[i];
             }
@@ -3394,20 +3424,39 @@ void terminal_worker_task(void) {
         else task_os();
     }
 }
-
 void create_new_task() {
     for(int i=0; i<MAX_WINDOWS; i++) if(!wins[i].active) {
+        // 1. COMPLETELY ZERO OUT THE STRUCT PHYSICALLY
+        memset(&wins[i], 0, sizeof(struct Window));
+        
         reset_window(&wins[i], i);
         wins[i].active=1; wins[i].maximized=0; wins[i].minimized=0;
         wins[i].kind = WINDOW_KIND_TERMINAL;
         wins[i].x=120+i*40; wins[i].y=70+i*30; wins[i].w=520; wins[i].h=320;
-        wins[i].total_rows=1; wins[i].cur_col=12;
-        lib_strcpy(wins[i].lines[0], "matrix:~$ > ");
+        
+        // 2. FORCE RESET CRITICAL COUNTERS TO ZERO
+        wins[i].total_rows = 1;
+        wins[i].cur_col = 12;
+        wins[i].edit_len = 0;    // FIX: Reclaim from garbage values
+        wins[i].cursor_pos = 0;
+        wins[i].submit_locked = 0;
+        wins[i].executing_cmd = 0;
+        memset(wins[i].cmd_buf, 0, sizeof(wins[i].cmd_buf));
+        lib_strcpy(wins[i].lines[0], PROMPT);
+
         terminal_env_bootstrap(&wins[i]);
         terminal_load_bashrc(&wins[i]);
+        
+        // 3. FINAL SANITY CHECK - Ensure bashrc didn't mess up state
+        wins[i].edit_len = 0;
+        wins[i].cursor_pos = 0;
+        wins[i].cmd_buf[0] = '\0';
+        
         set_window_title(&wins[i], i);
         seed_terminal_history(&wins[i]);
-        bring_to_front(i); break;
+        bring_to_front(i); 
+        active_win_idx = i;
+        break;
     }
 }
 
