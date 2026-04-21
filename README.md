@@ -271,3 +271,14 @@ make qemu
 - After modifying the WRP server, rebuild with `go build` and restart the server.
 - The OS does not support direct modern JS/CSS; interaction is handled via WRP's ISMAP path.
 - Input synchronization (clicks, scrolls) is managed via an OS-side action queue to avoid ID race conditions.
+
+## License
+
+This project integrates several open-source components:
+
+- **vibe-os (this fork)**: Released into the public domain under **The Unlicense**.
+- **mini-riscv-os**: Distributed under the **Two-clause BSD License**.
+- **WRP**: Distributed under the **Apache License 2.0**.
+
+For complete license texts, please see the [LICENSE](LICENSE) file.
+
