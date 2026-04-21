@@ -118,9 +118,9 @@ static void ns_reset_doc(struct ns_state *s, int keep_image);
 static void ns_start_navigation(struct Window *w, const char *url);
 static int ns_start_document_navigation(struct Window *w, const char *url);
 
-#define NS_FAV_COUNT 7
+#define NS_FAV_COUNT 8
 static const char *ns_fav_titles[NS_FAV_COUNT] = {
-    "68k News", "Hacker News", "DuckDuckGo", "FrogFind", "Lite Wiki", "Low-tech Mag", "Wttr.in"
+    "68k News", "Hacker News", "DuckDuckGo", "FrogFind", "Lite Wiki", "Low-tech Mag", "Wttr.in", "Wikipedia"
 };
 static const char *ns_fav_urls[NS_FAV_COUNT] = {
     "http://68k.news",
@@ -129,7 +129,8 @@ static const char *ns_fav_urls[NS_FAV_COUNT] = {
     "http://frogfind.com",
     "https://wikiless.org",
     "https://solar.lowtechmagazine.com",
-    "http://wttr.in"
+    "http://wttr.in",
+    "https://en.m.wikipedia.org"
 };
 
 // --- 渲染工具 (Floyd-Steinberg Dithering) ---
