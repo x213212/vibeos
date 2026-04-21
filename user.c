@@ -3769,19 +3769,7 @@ void draw_taskbar() {
 void gui_task(void) {
     extern void vga_update();
     extern void virtio_input_poll();
-    for(int i=0; i<MAX_WINDOWS; i++) { 
-        reset_window(&wins[i], i); 
-        z_order[i] = i; 
-        wins[i].cmd_buf[0] = '\0';
-    }
-    
-    // Create initial terminal window and set focus
-    int first_win = create_terminal_window();
-    if (first_win >= 0) {
-        active_win_idx = first_win;
-        bring_to_front(first_win);
-    }
-
+    for(int i=0; i<MAX_WINDOWS; i++) { reset_window(&wins[i], i); z_order[i] = i; }
     lib_printf("[BOOT] gui_task start active_win_idx=%d\n", active_win_idx);
     int last_mx = gui_mx, last_my = gui_my;
     int last_blink_phase = -1;
