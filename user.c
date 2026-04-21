@@ -3183,10 +3183,17 @@ void run_command(struct Window *w) {
     int pos = 0;
     int max_c = terminal_visible_cols(w);
 
-    while(pos < len && w->total_rows < ROWS) {
+    while(pos < len) {
         int t = 0;
         while(pos+t < len && res[pos+t] != '\n' && t < max_c) t++;
         
+        if (w->total_rows >= ROWS) {
+            // Shift lines up to scroll
+            for (int i = 1; i < ROWS; i++) lib_strcpy(w->lines[i - 1], w->lines[i]);
+            w->total_rows = ROWS - 1;
+            if (w->v_offset > 0) w->v_offset--;
+        }
+
         if (w->total_rows < ROWS) {
             for(int i=0; i<t; i++) w->lines[w->total_rows][i] = res[pos+i];
             w->lines[w->total_rows][t] = '\0';
@@ -3310,10 +3317,18 @@ static void handle_window_mailbox(struct Window *w) {
         
         if (w->waiting_wget) return;
         clear_prompt_input(w);
-        if (!is_clear && !app_running && w->total_rows < ROWS) {
-            w->total_rows++;
-            lib_strcpy(w->lines[w->total_rows-1], PROMPT);
-            w->cur_col = PROMPT_LEN;
+        if (!is_clear && !app_running) {
+            if (w->total_rows >= ROWS) {
+                // Shift lines up to scroll
+                for (int i = 1; i < ROWS; i++) lib_strcpy(w->lines[i - 1], w->lines[i]);
+                w->total_rows = ROWS - 1;
+                if (w->v_offset > 0) w->v_offset--;
+            }
+            if (w->total_rows < ROWS) {
+                w->total_rows++;
+                lib_strcpy(w->lines[w->total_rows-1], PROMPT);
+                w->cur_col = PROMPT_LEN;
+            }
         } else if (is_clear) {
             redraw_prompt_line(w, 0);
         }
@@ -4157,7 +4172,7 @@ void gui_task(void) {
             for(int i=0; i<MAX_WINDOWS; i++) draw_window(&wins[z_order[i]]);
             draw_taskbar(); draw_cursor(gui_mx, gui_my, 14, gui_cursor_mode); vga_update();
         }
-        lib_delay(3); if (need_resched) { need_resched = 0; task_os(); }
+        lib_delay(0); if (need_resched) { need_resched = 0; task_os(); }
     }
 }
 void network_task(void) {
