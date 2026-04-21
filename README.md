@@ -1,5 +1,3 @@
-# vibe-os
-
 `vibe-os` is an integrated RISC-V 32-bit QEMU browser OS.
 
 Lineage:
@@ -7,6 +5,19 @@ Lineage:
 - Original project: [cccriscv/mini-riscv-os](https://github.com/cccriscv/mini-riscv-os)
 - Referenced fork/base: [x213212/mini-riscv-os](https://github.com/x213212/mini-riscv-os)
 - This integration: `vibe-os`, based on `08-BlockDeviceDriver`, adding GUI networking, WRP, and browser support.
+
+<img width="1100" height="890" alt="image" src="https://github.com/user-attachments/assets/b1d2adb4-ee97-4041-b7a0-49c18a2152e6" />
+<img width="1100" height="890" alt="image" src="https://github.com/user-attachments/assets/35e27e5e-672e-47f2-9cae-d54827d4c796" />
+<img width="1100" height="890" alt="image" src="https://github.com/user-attachments/assets/432cee2d-ce12-4fb7-b3ac-943d71c7d955" />
+<img width="1100" height="890" alt="image" src="https://github.com/user-attachments/assets/99882167-bca3-445b-89dd-8fc1f0313f61" />
+<img width="1100" height="890" alt="image" src="https://github.com/user-attachments/assets/f7412eda-fdba-4f1e-bbc2-883a4fbdd3bb" />
+<img width="1100" height="890" alt="image" src="https://github.com/user-attachments/assets/864735b9-0ed5-476b-9a48-92150bcae609" />
+<img width="1100" height="890" alt="image" src="https://github.com/user-attachments/assets/7fdbed70-67d8-4762-9c15-f270bb0475e9" />
+<img width="1100" height="890" alt="image" src="https://github.com/user-attachments/assets/b147b2a3-4851-4113-bdce-13555412b1e9" />
+<img width="1100" height="890" alt="image" src="https://github.com/user-attachments/assets/38a5fde9-0bc5-473b-a229-82ecbe3d79b5" />
+<img width="1100" height="890" alt="image" src="https://github.com/user-attachments/assets/a2ab664b-2bbb-4de3-aa47-c0a0255a4059" />
+<img width="1100" height="890" alt="image" src="https://github.com/user-attachments/assets/6712ed96-689a-4d38-b809-7d2b2cd451a9" />
+<img width="1100" height="890" alt="image" src="https://github.com/user-attachments/assets/69e17ad8-be37-49eb-8a0f-a307290ed469" />
 
 This project extends from the `08-BlockDeviceDriver` stage of `mini-riscv-os`, adding a GUI, networking, NetSurf-style browser frontend, WRP server integration, and modern web browsing capabilities.
 
