@@ -10,7 +10,14 @@ char* strcpy(char *dst, const char *src) { lib_strcpy(dst, src); return dst; }
 char* strcat(char *dst, const char *src) { lib_strcat(dst, src); return dst; }
 int strcmp(const char *s1, const char *s2) { while (*s1 && (*s1 == *s2)) { s1++; s2++; } return *(unsigned char *)s1 - *(unsigned char *)s2; }
 uint32_t strlen(const char *s) { uint32_t n = 0; if(!s) return 0; while (*s++) n++; return n; }
-char* strchr(const char *s, int c) { while (*s) { if (*s == (char)c) return (char *)s; s++; } return 0; }
+char* strchr(const char *s, int c) {
+    char ch = (char)c;
+    while (*s) {
+        if (*s == ch) return (char *)s;
+        s++;
+    }
+    return ch == '\0' ? (char *)s : 0;
+}
 void* memchr(const void *s, int c, uint32_t n) { const unsigned char *p = (const unsigned char *)s; while (n--) { if (*p == (unsigned char)c) return (void *)p; p++; } return 0; }
 int memcmp(const void *a, const void *b, size_t n) { const unsigned char *pa = (const unsigned char *)a; const unsigned char *pb = (const unsigned char *)b; while (n--) { if (*pa != *pb) return (int)*pa - (int)*pb; pa++; pb++; } return 0; }
 char* strncpy(char *dest, const char *src, uint32_t n) { uint32_t i = 0; if(!dest || !src) return dest; for (; i < n && src[i]; i++) dest[i] = src[i]; for (; i < n; i++) dest[i] = '\0'; return dest; }

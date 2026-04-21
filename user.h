@@ -10,7 +10,7 @@
 #define MAX_WINDOWS 12
 #define ROWS 64 
 #define COLS 100 
-#define MAX_HIST 16
+#define MAX_HIST 512
 #define NETSURF_URL_MAX 512
 #define OUT_BUF_SIZE 2048
 #define INPUT_MAILBOX_SIZE 256

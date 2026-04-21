@@ -32,6 +32,7 @@ extern void lock_free(lock_t *lock);
 extern void page_init(void);
 extern void page_test(void);
 extern void mem_usage_info(uint32_t *total_pages, uint32_t *used_pages, uint32_t *free_pages, uint32_t *m_calls, uint32_t *f_calls);
+extern void kernel_heap_range_info(uint32_t *start, uint32_t *end);
 extern void *malloc(size_t size);
 extern void free(void *p);
 extern int appfs_open(const char *path, int flags);

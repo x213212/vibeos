@@ -12,6 +12,7 @@ NSFB_DIR = $(THIRD_PARTY_DIR)/libnsfb
 WCAP_DIR = $(THIRD_PARTY_DIR)/libwapcaplet
 PUTIL_DIR = $(THIRD_PARTY_DIR)/libparserutils
 HUB_DIR = $(THIRD_PARTY_DIR)/libhubbub
+TCC_DIR = /root/trade_new/os/mini-riscv-os/tcc-riscv32
 
 CFLAGS = -nostdlib -fno-builtin -mcmodel=medany -march=rv32imac -mabi=ilp32 -DLWIP_NO_CTYPE_H -DWITHOUT_ICONV_FILTER -g -Wall -w \
          -mno-relax \
@@ -22,6 +23,7 @@ CFLAGS = -nostdlib -fno-builtin -mcmodel=medany -march=rv32imac -mabi=ilp32 -DLW
          -I$(WCAP_DIR)/include \
          -I$(PUTIL_DIR)/include -I$(PUTIL_DIR)/src \
          -I$(HUB_DIR)/include -I$(HUB_DIR)/src \
+         -I$(TCC_DIR) -DTCC_TARGET_RISCV32 -DONE_SOURCE=1 -DCONFIG_TCC_STATIC -DCONFIG_TCC_PREDEFS=1 \
          -include netsurf_port.h \
          -Dprintf=lib_printf \
          -I$(MBEDTLS_DIR)/include -I$(MBEDTLS_DIR)/tf-psa-crypto/include -I$(MBEDTLS_DIR)/tf-psa-crypto/core -I$(MBEDTLS_DIR)/tf-psa-crypto/drivers/builtin/include -I$(MBEDTLS_DIR)/tf-psa-crypto/drivers/builtin/src -I$(MBEDTLS_DIR)/tf-psa-crypto/utilities \
@@ -75,7 +77,7 @@ HUB_SOURCES = $(HUB_DIR)/src/parser.c $(HUB_DIR)/src/tokeniser/tokeniser.c $(HUB
               $(HUB_DIR)/src/treebuilder/after_after_frameset.c $(HUB_DIR)/src/treebuilder/in_foreign_content.c \
               $(HUB_DIR)/src/treebuilder/generic_rcdata.c $(HUB_DIR)/src/treebuilder/element-type.c
 
-OBJ = start.s sys.s mem.s lib.c timer.c task.c os.c user.c user_utils.c user_netsurf.c tool_editor.c user_wget.c ssh_client.c fs.c 3d.c tool_asm.c app_runtime.c trap.c lock.c plic.c string.c vga.c font.c alloc.c mbedtls_entropy_compat.c mbedtls_port.c \
+OBJ = start.s sys.s mem.s lib.c timer.c task.c os.c user.c user_utils.c user_netsurf.c tool_editor.c user_wget.c ssh_client.c fs.c 3d.c tool_asm.c app_runtime.c trap.c lock.c plic.c string.c vga.c font.c alloc.c tcc_glue.c $(TCC_DIR)/libtcc.c mbedtls_entropy_compat.c mbedtls_port.c \
       mbedtls_compat.c \
       compat_time.c virtio_disk.c virtio_net.c virtio_input.c ac97_audio.c gbemu_runtime.c gbemu_audio_stub.c \
       gbemu_wasm/lib/cart.c gbemu_wasm/lib/cpu.c gbemu_wasm/lib/cpu_fetch.c gbemu_wasm/lib/cpu_proc.c \
@@ -128,7 +130,7 @@ OBJ = start.s sys.s mem.s lib.c timer.c task.c os.c user.c user_utils.c user_net
       lwip/src/apps/altcp_tls/altcp_tls_mbedtls.c lwip/src/apps/altcp_tls/altcp_tls_mbedtls_mem.c
 
 QEMU = qemu-system-riscv32
-QFLAGS = -smp 1 -machine virt -bios none \
+QFLAGS = -smp 1 -machine virt -m 1G -bios none \
          -drive if=none,format=raw,file=hdd.dsk,id=x0 \
          -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
          -device virtio-net-device,netdev=net0,mac=52:54:00:12:34:56,bus=virtio-mmio-bus.1,csum=off,guest_csum=off,gso=off,guest_tso4=off,guest_tso6=off,guest_ecn=off,guest_ufo=off,host_tso4=off,host_tso6=off,host_ecn=off,host_ufo=off,mrg_rxbuf=off,rx_queue_size=256,tx_queue_size=256 \

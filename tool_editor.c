@@ -585,6 +585,10 @@ void editor_handle_key(struct Window *w, char key) {
         }
     } else if (key == 10 || key == '\r') {
         editor_newline(w);
+    } else if (key == 9) { // Tab key
+        if (w->editor_mode == 1) { // Only in Insert Mode
+            for (int i = 0; i < 4; i++) editor_insert_char(w, ' ');
+        }
     } else if (key >= 32 && key < 127) {
         editor_insert_char(w, key);
     }

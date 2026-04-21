@@ -1,7 +1,9 @@
-#ifndef MINI_RISCV_OS_SYS_TIME_H
-#define MINI_RISCV_OS_SYS_TIME_H
+#ifndef _SYS_TIME_H
+#define _SYS_TIME_H
 
-#include "../time.h"
+#include <stdint.h>
+
+typedef int64_t time_t;
 
 struct timeval {
     time_t tv_sec;
@@ -13,6 +15,6 @@ struct timezone {
     int tz_dsttime;
 };
 
-int gettimeofday(struct timeval *tv, void *tzp);
+int gettimeofday(struct timeval *tv, void *tz);
 
 #endif

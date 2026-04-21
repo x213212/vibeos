@@ -142,6 +142,11 @@ void mem_usage_info(uint32_t *total_pages, uint32_t *used_pages, uint32_t *free_
   if (f_calls) *f_calls = _free_calls;
 }
 
+void kernel_heap_range_info(uint32_t *start, uint32_t *end) {
+  if (start) *start = _alloc_start;
+  if (end) *end = _alloc_end;
+}
+
 void *malloc(size_t size)
 {
   _malloc_calls++;

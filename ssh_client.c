@@ -1,6 +1,7 @@
 #include "user_internal.h"
 #include "errno.h"
 #include "libssh2.h"
+#include "libssh2_sftp.h"
 #include "lwip/altcp.h"
 #include "lwip/altcp_tcp.h"
 #include "lwip/ip_addr.h"
@@ -19,6 +20,8 @@ static uint16_t ssh_port = 22;
 static char ssh_password[64];
 static int ssh_password_set = 0;
 static char ssh_wrp_url[160];
+static char sftp_mount_root[160] = ".";
+static int sftp_mounted = 0;
 
 struct ssh_transport {
     struct altcp_pcb *pcb;
@@ -448,6 +451,8 @@ void ssh_client_reset(void)
     ssh_password[0] = '\0';
     ssh_password_set = 0;
     ssh_wrp_url[0] = '\0';
+    lib_strcpy(sftp_mount_root, ".");
+    sftp_mounted = 0;
 }
 
 int ssh_client_set_target(const char *spec, char *out, int out_max)
@@ -646,6 +651,158 @@ static int ssh_userauth_password_nonblock(LIBSSH2_SESSION *session, const char *
     }
 }
 
+static int ssh_open_authenticated_session(LIBSSH2_SESSION **out_session,
+                                          struct ssh_transport **out_transport,
+                                          char *out,
+                                          int out_max)
+{
+    LIBSSH2_SESSION *session = NULL;
+    struct ssh_transport *transport = NULL;
+    void **abstract_slot;
+    int rc;
+
+    if (!out_session || !out_transport) return -1;
+    *out_session = NULL;
+    *out_transport = NULL;
+
+    if (ssh_target[0] == '\0' || ssh_host[0] == '\0') {
+        ssh_set_msg(out, out_max, "ERR: ssh target not set.");
+        return -1;
+    }
+    if (!ssh_password_set) {
+        ssh_set_msg(out, out_max, "ERR: ssh auth <password> first.");
+        return -1;
+    }
+
+    ssh_log_build_stamp();
+    libssh2_init(0);
+
+    rc = ssh_connect_transport(&transport, ssh_host, ssh_port, out, out_max);
+    if (rc != 0) {
+        libssh2_exit();
+        return -1;
+    }
+
+    session = libssh2_session_init_ex(NULL, NULL, NULL, NULL);
+    if (!session) {
+        ssh_transport_destroy(transport);
+        libssh2_exit();
+        ssh_set_msg(out, out_max, "ERR: SSH session alloc failed.");
+        return -1;
+    }
+
+    libssh2_session_set_blocking(session, 0);
+    abstract_slot = libssh2_session_abstract(session);
+    *abstract_slot = transport;
+    libssh2_session_callback_set2(session, LIBSSH2_CALLBACK_SEND, (libssh2_cb_generic *)ssh_libssh2_send);
+    libssh2_session_callback_set2(session, LIBSSH2_CALLBACK_RECV, (libssh2_cb_generic *)ssh_libssh2_recv);
+
+    if (ssh_configure_session_methods(session) != 0) {
+        ssh_set_msg(out, out_max, "ERR: SSH method pref failed.");
+        libssh2_session_free(session);
+        ssh_transport_destroy(transport);
+        libssh2_exit();
+        return -1;
+    }
+
+    rc = ssh_session_handshake_nonblock(session, out, out_max);
+    if (rc != 0) {
+        libssh2_session_free(session);
+        ssh_transport_destroy(transport);
+        libssh2_exit();
+        return -1;
+    }
+
+    rc = ssh_userauth_password_nonblock(session, ssh_user[0] ? ssh_user : "root", ssh_password, out, out_max);
+    if (rc != 0) {
+        libssh2_session_disconnect_ex(session, SSH_DISCONNECT_BY_APPLICATION, "auth failed", "");
+        libssh2_session_free(session);
+        ssh_transport_destroy(transport);
+        libssh2_exit();
+        return -1;
+    }
+
+    *out_session = session;
+    *out_transport = transport;
+    return 0;
+}
+
+static void ssh_close_authenticated_session(LIBSSH2_SESSION *session, struct ssh_transport *transport)
+{
+    if (session) {
+        for (;;) {
+            int rc = libssh2_session_disconnect_ex(session, SSH_DISCONNECT_BY_APPLICATION, "bye", "");
+            if (rc == LIBSSH2_ERROR_EAGAIN) {
+                ssh_transport_pump();
+                continue;
+            }
+            break;
+        }
+        libssh2_session_free(session);
+    }
+    ssh_transport_destroy(transport);
+    libssh2_exit();
+}
+
+static LIBSSH2_SFTP *ssh_sftp_init_nonblock(LIBSSH2_SESSION *session, char *out, int out_max)
+{
+    LIBSSH2_SFTP *sftp;
+    uint32_t start = sys_now();
+
+    for (;;) {
+        sftp = libssh2_sftp_init(session);
+        if (sftp) return sftp;
+        if (libssh2_session_last_errno(session) != LIBSSH2_ERROR_EAGAIN) {
+            ssh_set_msg(out, out_max, "ERR: SFTP init failed.");
+            ssh_log_session_error(session, "sftp init fail");
+            return NULL;
+        }
+        if ((uint32_t)(sys_now() - start) > SSH_CONNECT_TIMEOUT_MS) {
+            ssh_set_msg(out, out_max, "ERR: SFTP init timeout.");
+            return NULL;
+        }
+        ssh_transport_pump();
+    }
+}
+
+static void ssh_sftp_shutdown_nonblock(LIBSSH2_SFTP *sftp)
+{
+    if (!sftp) return;
+    while (libssh2_sftp_shutdown(sftp) == LIBSSH2_ERROR_EAGAIN) {
+        ssh_transport_pump();
+    }
+}
+
+static void sftp_join_path(const char *base, const char *path, char *out, int out_max)
+{
+    int len;
+    if (!out || out_max <= 0) return;
+    out[0] = '\0';
+    if (path && path[0] == '/') {
+        lib_strcpy(out, path);
+        return;
+    }
+    if (!base || !*base) base = ".";
+    lib_strcpy(out, base);
+    len = strlen(out);
+    if (path && *path) {
+        if (len > 0 && out[len - 1] != '/') lib_strcat(out, "/");
+        lib_strcat(out, path);
+    }
+}
+
+static int sftp_basename_to_local(const char *remote, char *local, int local_max)
+{
+    const char *p;
+    (void)local_max;
+    if (!remote || !*remote || !local) return -1;
+    p = strrchr(remote, '/');
+    p = p ? p + 1 : remote;
+    if (!*p) return -1;
+    copy_name20(local, p);
+    return 0;
+}
+
 static int ssh_channel_exec_nonblock(LIBSSH2_SESSION *session, const char *cmd, char *out, int out_max)
 {
     LIBSSH2_CHANNEL *channel = NULL;
@@ -734,6 +891,343 @@ static int ssh_channel_exec_nonblock(LIBSSH2_SESSION *session, const char *cmd, 
     libssh2_channel_free(channel);
     ssh_log_session_error(session, "channel exec done");
     return 0;
+}
+
+int ssh_client_sftp_mount(const char *remote_root, char *out, int out_max)
+{
+    if (!remote_root || !*remote_root) remote_root = ".";
+    if ((int)strlen(remote_root) >= (int)sizeof(sftp_mount_root)) {
+        ssh_set_msg(out, out_max, "ERR: sftp mount path too long.");
+        return -1;
+    }
+    lib_strcpy(sftp_mount_root, remote_root);
+    sftp_mounted = 1;
+    if (out && out_max > 0) {
+        lib_strcpy(out, "OK: sftp mounted at ");
+        lib_strcat(out, sftp_mount_root);
+    }
+    return 0;
+}
+
+int ssh_client_sftp_status(char *out, int out_max)
+{
+    if (!out || out_max <= 0) return -1;
+    out[0] = '\0';
+    lib_strcat(out, "sftp: ");
+    lib_strcat(out, sftp_mounted ? sftp_mount_root : "(not mounted)");
+    lib_strcat(out, " target: ");
+    lib_strcat(out, ssh_target[0] ? ssh_target : "(unset)");
+    return 0;
+}
+
+int ssh_client_sftp_ls(const char *remote_path, char *out, int out_max)
+{
+    LIBSSH2_SESSION *session = NULL;
+    struct ssh_transport *transport = NULL;
+    LIBSSH2_SFTP *sftp = NULL;
+    LIBSSH2_SFTP_HANDLE *dir = NULL;
+    char full[192];
+    uint32_t start;
+    int rc = -1;
+
+    if (!out || out_max <= 0) return -1;
+    out[0] = '\0';
+    if (!sftp_mounted) ssh_client_sftp_mount(".", NULL, 0);
+    sftp_join_path(sftp_mount_root, remote_path && *remote_path ? remote_path : ".", full, sizeof(full));
+
+    if (ssh_open_authenticated_session(&session, &transport, out, out_max) != 0) return -1;
+    sftp = ssh_sftp_init_nonblock(session, out, out_max);
+    if (!sftp) goto done;
+
+    start = sys_now();
+    for (;;) {
+        dir = libssh2_sftp_opendir(sftp, full);
+        if (dir) break;
+        if (libssh2_session_last_errno(session) != LIBSSH2_ERROR_EAGAIN) {
+            ssh_set_msg(out, out_max, "ERR: SFTP opendir failed.");
+            goto done;
+        }
+        if ((uint32_t)(sys_now() - start) > SSH_EXEC_TIMEOUT_MS) {
+            ssh_set_msg(out, out_max, "ERR: SFTP opendir timeout.");
+            goto done;
+        }
+        ssh_transport_pump();
+    }
+
+    out[0] = '\0';
+    for (;;) {
+        char name[96];
+        LIBSSH2_SFTP_ATTRIBUTES attrs;
+        int n = libssh2_sftp_readdir(dir, name, sizeof(name) - 1, &attrs);
+        if (n == LIBSSH2_ERROR_EAGAIN) {
+            ssh_transport_pump();
+            continue;
+        }
+        if (n <= 0) break;
+        name[n] = '\0';
+        if ((int)strlen(out) + n + 32 >= out_max) break;
+        if ((attrs.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) &&
+            LIBSSH2_SFTP_S_ISDIR(attrs.permissions)) {
+            lib_strcat(out, "d ");
+        } else {
+            lib_strcat(out, "f ");
+        }
+        lib_strcat(out, name);
+        lib_strcat(out, "\n");
+    }
+    if (out[0] == '\0') lib_strcpy(out, "(empty)");
+    rc = 0;
+
+done:
+    if (dir) while (libssh2_sftp_closedir(dir) == LIBSSH2_ERROR_EAGAIN) ssh_transport_pump();
+    ssh_sftp_shutdown_nonblock(sftp);
+    ssh_close_authenticated_session(session, transport);
+    return rc;
+}
+
+int ssh_client_sftp_get(struct Window *w, const char *remote_path, const char *local_path, char *out, int out_max)
+{
+    LIBSSH2_SESSION *session = NULL;
+    struct ssh_transport *transport = NULL;
+    LIBSSH2_SFTP *sftp = NULL;
+    LIBSSH2_SFTP_HANDLE *fh = NULL;
+    unsigned char *buf = NULL;
+    uint32_t cap = 4096, len = 0;
+    char full[192], local[32];
+    int rc = -1;
+
+    if (!out || out_max <= 0) return -1;
+    out[0] = '\0';
+    if (!remote_path || !*remote_path) {
+        ssh_set_msg(out, out_max, "ERR: sftp get <remote> [local].");
+        return -1;
+    }
+    if (!sftp_mounted) ssh_client_sftp_mount(".", NULL, 0);
+    sftp_join_path(sftp_mount_root, remote_path, full, sizeof(full));
+    if (local_path && *local_path) copy_name20(local, local_path);
+    else if (sftp_basename_to_local(remote_path, local, sizeof(local)) != 0) {
+        ssh_set_msg(out, out_max, "ERR: bad local filename.");
+        return -1;
+    }
+
+    buf = (unsigned char *)malloc(cap);
+    if (!buf) {
+        ssh_set_msg(out, out_max, "ERR: no memory.");
+        return -1;
+    }
+    if (ssh_open_authenticated_session(&session, &transport, out, out_max) != 0) goto done;
+    sftp = ssh_sftp_init_nonblock(session, out, out_max);
+    if (!sftp) goto done;
+
+    for (;;) {
+        fh = libssh2_sftp_open(sftp, full, LIBSSH2_FXF_READ, 0);
+        if (fh) break;
+        if (libssh2_session_last_errno(session) != LIBSSH2_ERROR_EAGAIN) {
+            ssh_set_msg(out, out_max, "ERR: SFTP open failed.");
+            goto done;
+        }
+        ssh_transport_pump();
+    }
+
+    for (;;) {
+        char tmp[1024];
+        ssize_t n = libssh2_sftp_read(fh, tmp, sizeof(tmp));
+        if (n == LIBSSH2_ERROR_EAGAIN) {
+            ssh_transport_pump();
+            continue;
+        }
+        if (n < 0) {
+            ssh_set_msg(out, out_max, "ERR: SFTP read failed.");
+            goto done;
+        }
+        if (n == 0) break;
+        if (len + (uint32_t)n > WGET_MAX_FILE_SIZE) {
+            ssh_set_msg(out, out_max, "ERR: file too large.");
+            goto done;
+        }
+        if (len + (uint32_t)n > cap) {
+            uint32_t ncap = cap * 2;
+            unsigned char *nbuf;
+            while (ncap < len + (uint32_t)n) ncap *= 2;
+            nbuf = (unsigned char *)realloc(buf, ncap);
+            if (!nbuf) {
+                ssh_set_msg(out, out_max, "ERR: no memory.");
+                goto done;
+            }
+            buf = nbuf;
+            cap = ncap;
+        }
+        memcpy(buf + len, tmp, (uint32_t)n);
+        len += (uint32_t)n;
+    }
+
+    if (store_file_bytes(w, local, buf, len) != 0) {
+        ssh_set_msg(out, out_max, "ERR: local save failed.");
+        goto done;
+    }
+    snprintf(out, out_max, "OK: sftp get %s -> %s (%u bytes)", full, local, len);
+    rc = 0;
+
+done:
+    if (fh) while (libssh2_sftp_close(fh) == LIBSSH2_ERROR_EAGAIN) ssh_transport_pump();
+    ssh_sftp_shutdown_nonblock(sftp);
+    ssh_close_authenticated_session(session, transport);
+    if (buf) free(buf);
+    return rc;
+}
+
+int ssh_client_sftp_read_alloc(const char *remote_path, unsigned char **data, uint32_t *size, char *out, int out_max)
+{
+    LIBSSH2_SESSION *session = NULL;
+    struct ssh_transport *transport = NULL;
+    LIBSSH2_SFTP *sftp = NULL;
+    LIBSSH2_SFTP_HANDLE *fh = NULL;
+    unsigned char *buf = NULL;
+    uint32_t cap = 4096, len = 0;
+    char full[192];
+    int rc = -1;
+
+    if (data) *data = NULL;
+    if (size) *size = 0;
+    if (!data || !size) return -1;
+    if (out && out_max > 0) out[0] = '\0';
+    if (!remote_path || !*remote_path) {
+        ssh_set_msg(out, out_max, "ERR: sftp read <remote>.");
+        return -1;
+    }
+    if (!sftp_mounted) ssh_client_sftp_mount(".", NULL, 0);
+    sftp_join_path(sftp_mount_root, remote_path, full, sizeof(full));
+
+    buf = (unsigned char *)malloc(cap);
+    if (!buf) {
+        ssh_set_msg(out, out_max, "ERR: no memory.");
+        return -1;
+    }
+    if (ssh_open_authenticated_session(&session, &transport, out, out_max) != 0) goto done;
+    sftp = ssh_sftp_init_nonblock(session, out, out_max);
+    if (!sftp) goto done;
+
+    for (;;) {
+        fh = libssh2_sftp_open(sftp, full, LIBSSH2_FXF_READ, 0);
+        if (fh) break;
+        if (libssh2_session_last_errno(session) != LIBSSH2_ERROR_EAGAIN) {
+            ssh_set_msg(out, out_max, "ERR: SFTP open failed.");
+            goto done;
+        }
+        ssh_transport_pump();
+    }
+
+    for (;;) {
+        char tmp[1024];
+        ssize_t n = libssh2_sftp_read(fh, tmp, sizeof(tmp));
+        if (n == LIBSSH2_ERROR_EAGAIN) {
+            ssh_transport_pump();
+            continue;
+        }
+        if (n < 0) {
+            ssh_set_msg(out, out_max, "ERR: SFTP read failed.");
+            goto done;
+        }
+        if (n == 0) break;
+        if (len + (uint32_t)n > WGET_MAX_FILE_SIZE) {
+            ssh_set_msg(out, out_max, "ERR: file too large.");
+            goto done;
+        }
+        if (len + (uint32_t)n > cap) {
+            uint32_t ncap = cap * 2;
+            unsigned char *nbuf;
+            while (ncap < len + (uint32_t)n) ncap *= 2;
+            nbuf = (unsigned char *)realloc(buf, ncap);
+            if (!nbuf) {
+                ssh_set_msg(out, out_max, "ERR: no memory.");
+                goto done;
+            }
+            buf = nbuf;
+            cap = ncap;
+        }
+        memcpy(buf + len, tmp, (uint32_t)n);
+        len += (uint32_t)n;
+    }
+
+    *data = buf;
+    *size = len;
+    buf = NULL;
+    rc = 0;
+
+done:
+    if (fh) while (libssh2_sftp_close(fh) == LIBSSH2_ERROR_EAGAIN) ssh_transport_pump();
+    ssh_sftp_shutdown_nonblock(sftp);
+    ssh_close_authenticated_session(session, transport);
+    if (buf) free(buf);
+    return rc;
+}
+
+int ssh_client_sftp_put(struct Window *w, const char *local_path, const char *remote_path, char *out, int out_max)
+{
+    LIBSSH2_SESSION *session = NULL;
+    struct ssh_transport *transport = NULL;
+    LIBSSH2_SFTP *sftp = NULL;
+    LIBSSH2_SFTP_HANDLE *fh = NULL;
+    unsigned char *buf = NULL;
+    uint32_t size = 0, off = 0;
+    char full[192];
+    int rc = -1;
+
+    if (!out || out_max <= 0) return -1;
+    out[0] = '\0';
+    if (!local_path || !*local_path) {
+        ssh_set_msg(out, out_max, "ERR: sftp put <local> [remote].");
+        return -1;
+    }
+    if (load_file_bytes_alloc(w, local_path, &buf, &size) != 0 || !buf) {
+        ssh_set_msg(out, out_max, "ERR: local read failed.");
+        return -1;
+    }
+    if (!sftp_mounted) ssh_client_sftp_mount(".", NULL, 0);
+    sftp_join_path(sftp_mount_root, remote_path && *remote_path ? remote_path : local_path, full, sizeof(full));
+
+    if (ssh_open_authenticated_session(&session, &transport, out, out_max) != 0) goto done;
+    sftp = ssh_sftp_init_nonblock(session, out, out_max);
+    if (!sftp) goto done;
+
+    for (;;) {
+        fh = libssh2_sftp_open(sftp, full,
+                               LIBSSH2_FXF_WRITE | LIBSSH2_FXF_CREAT | LIBSSH2_FXF_TRUNC,
+                               LIBSSH2_SFTP_S_IRUSR | LIBSSH2_SFTP_S_IWUSR |
+                               LIBSSH2_SFTP_S_IRGRP | LIBSSH2_SFTP_S_IROTH);
+        if (fh) break;
+        if (libssh2_session_last_errno(session) != LIBSSH2_ERROR_EAGAIN) {
+            ssh_set_msg(out, out_max, "ERR: SFTP create failed.");
+            goto done;
+        }
+        ssh_transport_pump();
+    }
+
+    while (off < size) {
+        uint32_t chunk = size - off;
+        ssize_t n;
+        if (chunk > 1024) chunk = 1024;
+        n = libssh2_sftp_write(fh, (const char *)buf + off, chunk);
+        if (n == LIBSSH2_ERROR_EAGAIN) {
+            ssh_transport_pump();
+            continue;
+        }
+        if (n <= 0) {
+            ssh_set_msg(out, out_max, "ERR: SFTP write failed.");
+            goto done;
+        }
+        off += (uint32_t)n;
+    }
+
+    snprintf(out, out_max, "OK: sftp put %s -> %s (%u bytes)", local_path, full, size);
+    rc = 0;
+
+done:
+    if (fh) while (libssh2_sftp_close(fh) == LIBSSH2_ERROR_EAGAIN) ssh_transport_pump();
+    ssh_sftp_shutdown_nonblock(sftp);
+    ssh_close_authenticated_session(session, transport);
+    if (buf) free(buf);
+    return rc;
 }
 
 int ssh_client_exec_remote(const char *cmd, char *out, int out_max)

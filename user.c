@@ -306,6 +306,7 @@ static void append_terminal_line(struct Window *w, const char *text);
 static void terminal_app_stdout_flush(struct Window *w);
 void redraw_prompt_line(struct Window *w, int row);
 void terminal_append_prompt(struct Window *w);
+static void terminal_scroll_to_bottom(struct Window *w);
 static void set_shell_status(struct Window *w, const char *msg);
 static int terminal_visible_rows(struct Window *w);
 void close_window(int idx);
@@ -492,6 +493,7 @@ static void terminal_begin_ssh_auth(struct Window *w) {
     w->submit_locked = 0;
     clear_prompt_input(w);
     terminal_refresh_ssh_auth_prompt(w);
+    terminal_scroll_to_bottom(w);
 }
 
 static void terminal_cancel_ssh_auth(struct Window *w) {
@@ -502,6 +504,7 @@ static void terminal_cancel_ssh_auth(struct Window *w) {
     w->submit_locked = 0;
     clear_prompt_input(w);
     if (w->total_rows > 0) redraw_prompt_line(w, w->total_rows - 1);
+    terminal_scroll_to_bottom(w);
 }
 
 static void terminal_submit_ssh_auth(struct Window *w) {
@@ -520,29 +523,40 @@ static void terminal_submit_ssh_auth(struct Window *w) {
     w->submit_locked = 0;
     clear_prompt_input(w);
     terminal_append_prompt(w);
+    terminal_scroll_to_bottom(w);
+}
+
+static void terminal_history_set(struct Window *w, int idx, const char *s) {
+    int i = 0;
+    if (!w || idx < 0 || idx >= MAX_HIST) return;
+    if (!s) s = "";
+    while (s[i] && i < COLS - 1) {
+        w->history[idx][i] = s[i];
+        i++;
+    }
+    w->history[idx][i] = '\0';
 }
 
 static void seed_terminal_history(struct Window *w) {
     if (!w || w->kind != WINDOW_KIND_TERMINAL) return;
     if (w->hist_count > 0) return;
-    lib_strcpy(w->history[0], "env");
-    lib_strcpy(w->history[1], "alias ll=ls -all");
-    lib_strcpy(w->history[2], "alias c=clear");
-    lib_strcpy(w->history[3], "source ~/.bashrc");
-    lib_strcpy(w->history[4], ". ~/.bashrc");
-    lib_strcpy(w->history[5], "cd ~");
-    lib_strcpy(w->history[6], "export WSL_IP=<WSL_IP>");
-    lib_strcpy(w->history[7], "ssh status");
-    lib_strcpy(w->history[8], "ssh root@192.168.123.100:2221");
-    lib_strcpy(w->history[9], "ssh auth");
-    lib_strcpy(w->history[10], "ssh exec uname -a");
-    lib_strcpy(w->history[11], "ssh exec ls");
-    lib_strcpy(w->history[12], "wrp set http://192.168.123.100:9999");
-    lib_strcpy(w->history[13], "netsurf https://duckduckgo.com");
-    lib_strcpy(w->history[14], "netsurf https://example.com");
-    lib_strcpy(w->history[15], "wget https://192.168.123.100/lez.gb lez.gb");
-    lib_strcpy(w->history[16], "gbemu lez.gb");
-    w->hist_count = 17;
+    terminal_history_set(w, 0, "env");
+    terminal_history_set(w, 1, "alias ll=ls -all");
+    terminal_history_set(w, 2, "alias c=clear");
+    terminal_history_set(w, 3, "source ~/.bashrc");
+    terminal_history_set(w, 4, ". ~/.bashrc");
+    terminal_history_set(w, 5, "ssh root@192.168.123.100:2221");
+    terminal_history_set(w, 6, "ssh auth");
+    terminal_history_set(w, 7, "sftp mount /root/trade_new/os/mini-riscv-os/08-BlockDeviceDriver/http_test");
+    terminal_history_set(w, 8, "ls /sftp");
+    terminal_history_set(w, 9, "cat /sftp/jit_memtest.c");
+    terminal_history_set(w, 10, "jit /sftp/jit_memtest.c");
+    terminal_history_set(w, 11, "ssh exec uname -a");
+    terminal_history_set(w, 12, "ssh exec ls");
+    terminal_history_set(w, 13, "wrp set http://192.168.123.100:9999");
+    terminal_history_set(w, 14, "netsurf https://duckduckgo.com");
+    terminal_history_set(w, 15, "gbemu lez.gb");
+    w->hist_count = 16;
     w->hist_idx = -1;
 }
 
@@ -1617,6 +1631,7 @@ static int is_name_completion_cmd(const char *cmd) {
            strcmp(cmd, "source") == 0 ||
            strcmp(cmd, "run") == 0 ||
            strcmp(cmd, "ssh") == 0 ||
+           strcmp(cmd, "sftp") == 0 ||
            strcmp(cmd, "wget") == 0 ||
            strcmp(cmd, "unset") == 0 ||
            strcmp(cmd, "wrp") == 0 ||
@@ -1684,7 +1699,7 @@ static void apply_completion(struct Window *w, int row, int token_start, int tok
 
 static int tab_complete_command(struct Window *w, int row, int token_start, int token_end) {
     static const char *cmds[] = {
-        "pwd", "format", "cd", "ls", "mkdir", "rm", "touch", "write", "cat", "wget", "open", "run", "gbemu", "demo3d", "frankenstein", "help", "clear", "mv", "rename", "netsurf", "ssh", "wrp", "find", "mem", "df", "du", "alias", "unalias", "export", "unset", "source"
+        "pwd", "format", "cd", "ls", "mkdir", "rm", "touch", "write", "cat", "wget", "open", "run", "gbemu", "demo3d", "frankenstein", "help", "clear", "mv", "rename", "netsurf", "ssh", "sftp", "wrp", "find", "mem", "df", "du", "alias", "unalias", "export", "unset", "source"
     };
     char prefix[COLS];
     int plen = token_end - token_start;
@@ -2707,11 +2722,239 @@ static int check_dir_and_list(struct Window *w, const char *path, char *out) {
     return 0;
 }
 
+extern void os_jit_run(const char *source);
+
+static int path_is_sftp(const char *path) {
+    return path && strncmp(path, "/sftp", 5) == 0 &&
+           (path[5] == '\0' || path[5] == '/');
+}
+
+static const char *sftp_subpath(const char *path) {
+    if (!path_is_sftp(path)) return path;
+    path += 5;
+    if (*path == '/') path++;
+    return *path ? path : ".";
+}
+
+extern uint32_t TEXT_START, TEXT_END;
+extern uint32_t RODATA_START, RODATA_END;
+extern uint32_t DATA_START, DATA_END;
+extern uint32_t BSS_START, BSS_END;
+extern uint32_t HEAP_START, HEAP_SIZE;
+extern void jit_uheap_info(uint32_t *base, uint32_t *size, uint32_t *used, uint32_t *free_bytes, uint32_t *blocks);
+
+static void out_append(char *out, const char *s) {
+    int n = strlen(out);
+    int i = 0;
+    while (s && s[i] && n < OUT_BUF_SIZE - 1) {
+        out[n++] = s[i++];
+    }
+    out[n] = '\0';
+}
+
+static int parse_hex_u32(const char *s, uint32_t *out, const char **endp) {
+    uint32_t v = 0;
+    int any = 0;
+    while (*s == ' ' || *s == '\t') s++;
+    if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
+    while (*s) {
+        int d = -1;
+        if (*s >= '0' && *s <= '9') d = *s - '0';
+        else if (*s >= 'a' && *s <= 'f') d = *s - 'a' + 10;
+        else if (*s >= 'A' && *s <= 'F') d = *s - 'A' + 10;
+        else break;
+        v = (v << 4) | (uint32_t)d;
+        any = 1;
+        s++;
+    }
+    if (!any) return -1;
+    if (out) *out = v;
+    if (endp) *endp = s;
+    return 0;
+}
+
+static int mem_range_safe(uint32_t addr, uint32_t len) {
+    uint32_t end;
+    if (len == 0) return 0;
+    end = addr + len;
+    if (end < addr) return 0;
+    return addr >= (uint32_t)(uintptr_t)TEXT_START && end <= (uint32_t)(uintptr_t)APP_END;
+}
+
+static void mem_append_map(char *out) {
+    char row[160];
+    uint32_t kstart = 0, kend = 0;
+    uint32_t ub = 0, us = 0, uu = 0, uf = 0, ublk = 0;
+    kernel_heap_range_info(&kstart, &kend);
+    jit_uheap_info(&ub, &us, &uu, &uf, &ublk);
+    out[0] = '\0';
+    snprintf(row, sizeof(row), "Memory map:\ntext   %x-%x\nrodata %x-%x\ndata   %x-%x\nbss    %x-%x\n",
+             (uint32_t)(uintptr_t)TEXT_START, (uint32_t)(uintptr_t)TEXT_END,
+             (uint32_t)(uintptr_t)RODATA_START, (uint32_t)(uintptr_t)RODATA_END,
+             (uint32_t)(uintptr_t)DATA_START, (uint32_t)(uintptr_t)DATA_END,
+             (uint32_t)(uintptr_t)BSS_START, (uint32_t)(uintptr_t)BSS_END);
+    out_append(out, row);
+    snprintf(row, sizeof(row), "kheap  %x-%x size=%uKB\n", kstart, kend, (kend - kstart) / 1024);
+    out_append(out, row);
+    snprintf(row, sizeof(row), "uheap  %x-%x used=%uKB free=%uKB blocks=%u\n", ub, ub + us, uu / 1024, uf / 1024, ublk);
+    out_append(out, row);
+    snprintf(row, sizeof(row), "app    %x-%x size=%uKB\n", (uint32_t)(uintptr_t)APP_START, (uint32_t)(uintptr_t)APP_END, (uint32_t)(uintptr_t)APP_SIZE / 1024);
+    out_append(out, row);
+    if (loaded_app_heap_hi > loaded_app_heap_lo) {
+        snprintf(row, sizeof(row), "appheap %x-%x cur=%x\n", (uint32_t)loaded_app_heap_lo, (uint32_t)loaded_app_heap_hi, (uint32_t)loaded_app_heap_cur);
+        out_append(out, row);
+    }
+}
+
+static void mem_dump_range(char *out, uint32_t addr, uint32_t len) {
+    static const char hex[] = "0123456789abcdef";
+    const uint8_t *p = (const uint8_t *)(uintptr_t)addr;
+    char row[128];
+    if (len == 0) len = 128;
+    if (len > 256) len = 256;
+    out[0] = '\0';
+    if (!mem_range_safe(addr, len)) {
+        snprintf(out, OUT_BUF_SIZE, "ERR: unsafe range %x + %u. Use 'mem map' first.", addr, len);
+        return;
+    }
+    for (uint32_t off = 0; off < len; off += 16) {
+        char bytes[16 * 3 + 1];
+        char ascii[17];
+        uint32_t n = len - off;
+        int bp = 0;
+        if (n > 16) n = 16;
+        for (uint32_t i = 0; i < 16; i++) {
+            if (i < n) {
+                uint8_t c = p[off + i];
+                bytes[bp++] = hex[c >> 4];
+                bytes[bp++] = hex[c & 15];
+                bytes[bp++] = ' ';
+                ascii[i] = (c >= 32 && c < 127) ? (char)c : '.';
+            } else {
+                bytes[bp++] = ' ';
+                bytes[bp++] = ' ';
+                bytes[bp++] = ' ';
+                ascii[i] = ' ';
+            }
+        }
+        bytes[bp] = '\0';
+        ascii[16] = '\0';
+        snprintf(row, sizeof(row), "%x: %s |%s|\n", addr + off, bytes, ascii);
+        out_append(out, row);
+    }
+}
+
+static void exec_mem_cmd(char *out, char *arg) {
+    char row[160];
+    while (*arg == ' ' || *arg == '\t') arg++;
+    if (*arg == '\0') {
+        uint32_t total, used, free_pg, m_calls, f_calls;
+        uint32_t ub = 0, us = 0, uu = 0, uf = 0, ublk = 0;
+        mem_usage_info(&total, &used, &free_pg, &m_calls, &f_calls);
+        jit_uheap_info(&ub, &us, &uu, &uf, &ublk);
+        snprintf(out, OUT_BUF_SIZE,
+                 "RAM: total=%uKB, used=%uKB, free=%uKB\nActivity: malloc=%u, free=%u\nJIT uheap: base=%x size=%uKB used=%uKB free=%uKB blocks=%u",
+                 total * 4, used * 4, free_pg * 4, m_calls, f_calls,
+                 ub, us / 1024, uu / 1024, uf / 1024, ublk);
+        return;
+    }
+    if (strcmp(arg, "h") == 0 || strcmp(arg, "-h") == 0) {
+        lib_strcpy(out, "usage: mem | mem map | mem view <hex_addr|kheap|uheap|app> [len<=256]");
+        return;
+    }
+    if (strncmp(arg, "map", 3) == 0 && (arg[3] == '\0' || arg[3] == ' ')) {
+        mem_append_map(out);
+        return;
+    }
+    if (strncmp(arg, "view", 4) == 0 && (arg[4] == '\0' || arg[4] == ' ')) {
+        uint32_t addr = 0;
+        uint32_t len = 128;
+        uint32_t kstart = 0, kend = 0;
+        uint32_t ub = 0, us = 0, uu = 0, uf = 0, ublk = 0;
+        const char *endp = NULL;
+        arg += 4;
+        while (*arg == ' ' || *arg == '\t') arg++;
+        if (*arg == '\0') {
+            lib_strcpy(out, "usage: mem view <hex_addr|kheap|uheap|app> [len<=256]");
+            return;
+        }
+        if (strncmp(arg, "kheap", 5) == 0 && (arg[5] == '\0' || arg[5] == ' ')) {
+            kernel_heap_range_info(&kstart, &kend);
+            addr = kstart;
+            arg += 5;
+        } else if (strncmp(arg, "uheap", 5) == 0 && (arg[5] == '\0' || arg[5] == ' ')) {
+            jit_uheap_info(&ub, &us, &uu, &uf, &ublk);
+            addr = ub;
+            arg += 5;
+        } else if (strncmp(arg, "app", 3) == 0 && (arg[3] == '\0' || arg[3] == ' ')) {
+            addr = (uint32_t)(uintptr_t)APP_START;
+            arg += 3;
+        } else {
+            if (parse_hex_u32(arg, &addr, &endp) != 0) {
+                lib_strcpy(out, "ERR: bad address. Example: mem view 80000000 128");
+                return;
+            }
+            arg = (char *)endp;
+        }
+        while (*arg == ' ' || *arg == '\t') arg++;
+        if (*arg) {
+            int n = atoi(arg);
+            if (n > 0) len = (uint32_t)n;
+        }
+        if (len > 256) len = 256;
+        mem_dump_range(out, addr, len);
+        return;
+    }
+    snprintf(row, sizeof(row), "ERR: mem | mem map | mem view <addr> [len]");
+    lib_strcpy(out, row);
+}
+
 void exec_single_cmd(struct Window *w, char *cmd) {
     char *out = w->out_buf; out[0] = '\0';
-    if (strncmp(cmd, "pwd", 3) == 0) { 
+    if (strncmp(cmd, "jit", 3) == 0 && (cmd[3] == ' ' || cmd[3] == '\0')) {
+        char *arg = cmd + 3; while (*arg == ' ') arg++;
+        if (*arg == '\0') {
+            lib_strcpy(out, "usage: jit \"source code\" OR jit file.c");
+            return;
+        }
+        if (arg[0] == '"') {
+            char *source = arg + 1;
+            char *end = strrchr(source, '"');
+            if (end) *end = '\0';
+            os_jit_run(source);
+            lib_strcpy(out, "JIT execution finished.");
+        } else {
+            uint32_t size = 0;
+            if (path_is_sftp(arg)) {
+                unsigned char *remote_buf = NULL;
+                char msg[OUT_BUF_SIZE];
+                if (ssh_client_sftp_read_alloc(sftp_subpath(arg), &remote_buf, &size, msg, sizeof(msg)) == 0 && remote_buf) {
+                    char *src = (char *)malloc(size + 1);
+                    if (!src) {
+                        free(remote_buf);
+                        lib_strcpy(out, "ERR: No Memory.");
+                        return;
+                    }
+                    memcpy(src, remote_buf, size);
+                    src[size] = '\0';
+                    free(remote_buf);
+                    os_jit_run(src);
+                    free(src);
+                    lib_strcpy(out, "JIT SFTP file execution finished.");
+                } else {
+                    lib_strcpy(out, msg[0] ? msg : "ERR: Could not read SFTP file.");
+                }
+            } else if (load_file_bytes(w, arg, file_io_buf, WGET_MAX_FILE_SIZE, &size) == 0) {
+                file_io_buf[size] = '\0';
+                os_jit_run((const char *)file_io_buf);
+                lib_strcpy(out, "JIT file execution finished.");
+            } else {
+                lib_strcpy(out, "ERR: Could not read file.");
+            }
+        }
+    } else if (strncmp(cmd, "pwd", 3) == 0) {
         if (cmd[3] == ' ' && (cmd[4] == 'h' || cmd[4] == '-')) { lib_strcpy(out, "usage: pwd"); return; }
-        lib_strcpy(out, w->cwd); 
+        lib_strcpy(out, w->cwd);
     }
     else if (strncmp(cmd, "df", 2) == 0 && (cmd[2] == '\0' || cmd[2] == ' ')) {
         if (cmd[2] == ' ' && (cmd[3] == 'h' || cmd[3] == '-')) { lib_strcpy(out, "usage: df"); return; }
@@ -2972,6 +3215,10 @@ void exec_single_cmd(struct Window *w, char *cmd) {
         char single_out[OUT_BUF_SIZE];
         single_out[0] = '\0';
         if (*path_arg != '\0' && strcmp(path_arg, "-all") != 0) {
+            if (path_is_sftp(path_arg)) {
+                ssh_client_sftp_ls(sftp_subpath(path_arg), out, OUT_BUF_SIZE);
+                return;
+            }
             uint32_t p_bno = 0; char p_cwd[128], leaf[20];
             if (resolve_fs_target(w, path_arg, &p_bno, p_cwd, leaf) == 0) {
                 if (leaf[0] == '\0' || strcmp(leaf, ".") == 0) { target_bno = p_bno; }
@@ -3019,6 +3266,48 @@ void exec_single_cmd(struct Window *w, char *cmd) {
             printed = 1;
         }
         if (!printed) lib_strcpy(out, "(empty)");
+    } else if (strncmp(cmd, "sftp", 4) == 0 && (cmd[4] == '\0' || cmd[4] == ' ')) {
+        char *arg = cmd + 4;
+        while (*arg == ' ') arg++;
+        if (*arg == 'h' && (*(arg+1) == '\0' || *(arg+1) == ' ')) {
+            lib_strcpy(out, "usage: sftp status | sftp mount [remote_root] | sftp ls [path] | sftp get <remote> [local] | sftp put <local> [remote]");
+            return;
+        }
+        if (*arg == '\0' || strcmp(arg, "status") == 0) {
+            ssh_client_sftp_status(out, OUT_BUF_SIZE);
+        } else if (strncmp(arg, "mount", 5) == 0 && (arg[5] == '\0' || arg[5] == ' ')) {
+            char *root = arg + 5;
+            while (*root == ' ') root++;
+            ssh_client_sftp_mount(*root ? root : ".", out, OUT_BUF_SIZE);
+        } else if (strncmp(arg, "ls", 2) == 0 && (arg[2] == '\0' || arg[2] == ' ')) {
+            char *path = arg + 2;
+            while (*path == ' ') path++;
+            ssh_client_sftp_ls(path, out, OUT_BUF_SIZE);
+        } else if (strncmp(arg, "get ", 4) == 0) {
+            char *remote = arg + 4;
+            char *local;
+            while (*remote == ' ') remote++;
+            local = strchr(remote, ' ');
+            if (local) {
+                *local++ = '\0';
+                while (*local == ' ') local++;
+                if (*local == '\0') local = NULL;
+            }
+            ssh_client_sftp_get(w, remote, local, out, OUT_BUF_SIZE);
+        } else if (strncmp(arg, "put ", 4) == 0) {
+            char *local = arg + 4;
+            char *remote;
+            while (*local == ' ') local++;
+            remote = strchr(local, ' ');
+            if (remote) {
+                *remote++ = '\0';
+                while (*remote == ' ') remote++;
+                if (*remote == '\0') remote = NULL;
+            }
+            ssh_client_sftp_put(w, local, remote, out, OUT_BUF_SIZE);
+        } else {
+            lib_strcpy(out, "ERR: sftp status | mount | ls | get | put");
+        }
     } else if (strncmp(cmd, "ssh", 3) == 0 && (cmd[3] == '\0' || cmd[3] == ' ')) {
         char *arg = cmd + 3;
         while (*arg == ' ') arg++;
@@ -3193,6 +3482,21 @@ void exec_single_cmd(struct Window *w, char *cmd) {
     } else if (strncmp(cmd, "cat ", 4) == 0) {
         char *fn = cmd + 4; while (*fn == ' ') fn++;
         if (strcmp(fn, "h") == 0) { lib_strcpy(out, "usage: cat <path>"); return; }
+        if (path_is_sftp(fn)) {
+            unsigned char *remote_buf = NULL;
+            uint32_t remote_size = 0;
+            char msg[OUT_BUF_SIZE];
+            if (ssh_client_sftp_read_alloc(sftp_subpath(fn), &remote_buf, &remote_size, msg, sizeof(msg)) == 0 && remote_buf) {
+                uint32_t n = remote_size;
+                if (n >= OUT_BUF_SIZE) n = OUT_BUF_SIZE - 1;
+                memcpy(out, remote_buf, n);
+                out[n] = '\0';
+                free(remote_buf);
+            } else {
+                lib_strcpy(out, msg[0] ? msg : "ERR: SFTP Cat Failed.");
+            }
+            return;
+        }
         
         // Path resolution for smart behavior
         char expanded[128]; uint32_t p_bno = 0; char p_cwd[128], leaf[20];
@@ -3443,14 +3747,9 @@ void exec_single_cmd(struct Window *w, char *cmd) {
             }
         } else lib_strcpy(out, "ERR: No Free Window.");
     } else if (strncmp(cmd, "mem", 3) == 0 && (cmd[3] == '\0' || cmd[3] == ' ')) {
-        uint32_t total, used, free_pg, m_calls, f_calls;
-        mem_usage_info(&total, &used, &free_pg, &m_calls, &f_calls);
-        char row[128];
-        snprintf(row, sizeof(row), "RAM: total=%uKB, used=%uKB, free=%uKB\nActivity: malloc=%u, free=%u", 
-                 total*4, used*4, free_pg*4, m_calls, f_calls);
-        lib_strcpy(out, row);
+        exec_mem_cmd(out, cmd + 3);
     } else if (strncmp(cmd, "help", 4) == 0) {
-        lib_strcpy(out, "Commands: ls, find, mem, df, du, mkdir, rm, mv, touch, cd, pwd, write, cat, wget, open, run, gbemu, vim, asm, demo3d, frankenstein, netsurf, ssh, wrp, format, clear, env, export, unset, alias, unalias, source, ., echo\nType '<cmd> h' for usage.");
+        lib_strcpy(out, "Commands: ls, find, mem, df, du, mkdir, rm, mv, touch, cd, pwd, write, cat, wget, open, run, gbemu, vim, asm, demo3d, frankenstein, netsurf, ssh, sftp, wrp, format, clear, env, export, unset, alias, unalias, source, ., echo\nType '<cmd> h' for usage.");
     } else { lib_strcpy(out, "Invalid signal."); }
 }
 void run_command(struct Window *w) {
@@ -3469,8 +3768,8 @@ void run_command(struct Window *w) {
     // 指令紀錄與清除處理
     if (w->edit_len > 0) {
         if (w->hist_count == 0 || strcmp(w->history[0], full_cmd) != 0) {
-            for(int i=MAX_HIST-1; i>0; i--) lib_strcpy(w->history[i], w->history[i-1]);
-            lib_strcpy(w->history[0], full_cmd); 
+            for (int i = MAX_HIST - 1; i > 0; i--) terminal_history_set(w, i, w->history[i - 1]);
+            terminal_history_set(w, 0, full_cmd);
             if(w->hist_count < MAX_HIST) w->hist_count++;
         }
     }
