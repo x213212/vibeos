@@ -1,6 +1,7 @@
 *.o
 *.elf
 *.bin
+.build/
 wrp/wrp
 wrp/go-build/
 .gdb_history

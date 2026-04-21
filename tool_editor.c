@@ -6,6 +6,7 @@
 
 extern void editor_handle_key(struct Window *w, char key);
 extern void editor_load_bytes(struct Window *w, const unsigned char *src, uint32_t size);
+extern int editor_load_file_window(struct Window *w, uint32_t start_line);
 extern void editor_clear(struct Window *w);
 extern void editor_set_status(struct Window *w, const char *msg);
 extern void editor_render(struct Window *w, int x, int y, int ww, int wh);
@@ -25,6 +26,12 @@ void editor_clear(struct Window *w) {
     w->editor_cmd_cursor = 0;
     w->editor_dirty = 0;
     w->editor_pending_d = 0;
+    w->editor_readonly = 0;
+    w->editor_lazy = 0;
+    w->editor_loaded_complete = 0;
+    w->editor_file_bno = 0;
+    w->editor_file_size = 0;
+    w->editor_loaded_start_line = 0;
     w->editor_lines[0][0] = '\0';
     w->editor_cmd[0] = '\0';
     w->editor_status[0] = '\0';
@@ -120,6 +127,16 @@ static void editor_move_end(struct Window *w) {
 
 static void editor_page_up(struct Window *w) {
     int rows = editor_visible_rows(w);
+    if (w->editor_lazy && w->editor_cursor_row == 0 && w->editor_loaded_start_line > 0) {
+        uint32_t start = (w->editor_loaded_start_line > (uint32_t)EDITOR_MAX_LINES) ?
+                         w->editor_loaded_start_line - EDITOR_MAX_LINES : 0;
+        if (editor_load_file_window(w, start) == 0) {
+            w->editor_cursor_row = w->editor_line_count - 1;
+            w->editor_scroll_row = w->editor_line_count - rows;
+            if (w->editor_scroll_row < 0) w->editor_scroll_row = 0;
+        }
+        return;
+    }
     w->editor_cursor_row -= rows;
     if (w->editor_cursor_row < 0) w->editor_cursor_row = 0;
     int len = editor_line_len(w->editor_lines[w->editor_cursor_row]);
@@ -128,6 +145,13 @@ static void editor_page_up(struct Window *w) {
 
 static void editor_page_down(struct Window *w) {
     int rows = editor_visible_rows(w);
+    if (w->editor_lazy && w->editor_cursor_row + 1 >= w->editor_line_count && !w->editor_loaded_complete) {
+        if (editor_load_file_window(w, w->editor_loaded_start_line + (uint32_t)w->editor_line_count) == 0) {
+            w->editor_cursor_row = 0;
+            w->editor_scroll_row = 0;
+        }
+        return;
+    }
     w->editor_cursor_row += rows;
     if (w->editor_cursor_row >= w->editor_line_count) w->editor_cursor_row = w->editor_line_count - 1;
     int len = editor_line_len(w->editor_lines[w->editor_cursor_row]);
@@ -222,6 +246,10 @@ void editor_load_bytes(struct Window *w, const unsigned char *src, uint32_t size
     w->editor_cmd_cursor = 0;
     w->editor_dirty = 0;
     w->editor_pending_d = 0;
+    w->editor_readonly = 0;
+    w->editor_lazy = 0;
+    w->editor_loaded_complete = 1;
+    w->editor_loaded_start_line = 0;
     w->editor_status[0] = '\0';
 }
 
@@ -232,6 +260,10 @@ static void editor_touch_status(struct Window *w, const char *msg) {
 static int editor_save_file(struct Window *w) {
     unsigned char buf[EDITOR_MAX_LINES * EDITOR_LINE_LEN + EDITOR_MAX_LINES];
     uint32_t size = 0;
+    if (w->editor_readonly) {
+        editor_touch_status(w, "Read-only truncated view");
+        return -3;
+    }
     if (editor_collect_bytes(w, buf, sizeof(buf), &size) != 0) {
         editor_touch_status(w, "File too big");
         return -1;
@@ -290,6 +322,13 @@ static void editor_move_up(struct Window *w) {
         w->editor_cursor_row--;
         int len = editor_line_len(w->editor_lines[w->editor_cursor_row]);
         if (w->editor_cursor_col > len) w->editor_cursor_col = len;
+    } else if (w->editor_lazy && w->editor_loaded_start_line > 0) {
+        uint32_t start = (w->editor_loaded_start_line > (uint32_t)EDITOR_MAX_LINES) ?
+                         w->editor_loaded_start_line - EDITOR_MAX_LINES : 0;
+        if (editor_load_file_window(w, start) == 0) {
+            w->editor_cursor_row = w->editor_line_count - 1;
+            w->editor_cursor_col = 0;
+        }
     }
 }
 
@@ -298,7 +337,28 @@ static void editor_move_down(struct Window *w) {
         w->editor_cursor_row++;
         int len = editor_line_len(w->editor_lines[w->editor_cursor_row]);
         if (w->editor_cursor_col > len) w->editor_cursor_col = len;
+    } else if (w->editor_lazy && !w->editor_loaded_complete) {
+        if (editor_load_file_window(w, w->editor_loaded_start_line + (uint32_t)w->editor_line_count) == 0) {
+            w->editor_cursor_row = 0;
+            w->editor_cursor_col = 0;
+        }
     }
+}
+
+static int editor_parse_positive_int(const char *s, uint32_t *out) {
+    uint32_t v = 0;
+    int seen = 0;
+    if (!s || !out) return 0;
+    while (*s == ' ') s++;
+    while (*s >= '0' && *s <= '9') {
+        seen = 1;
+        v = v * 10U + (uint32_t)(*s - '0');
+        s++;
+    }
+    while (*s == ' ') s++;
+    if (!seen || *s != '\0') return 0;
+    *out = v;
+    return 1;
 }
 
 static void editor_apply_command(struct Window *w) {
@@ -313,7 +373,28 @@ static void editor_apply_command(struct Window *w) {
     } else if (strcmp(w->editor_cmd, "q!") == 0) {
         close_window(w->id);
     } else if (w->editor_cmd[0] != '\0') {
-        editor_set_status(w, "Unknown command");
+        uint32_t line_no = 0;
+        if (editor_parse_positive_int(w->editor_cmd, &line_no) && line_no > 0) {
+            uint32_t target = line_no - 1U;
+            if (w->editor_lazy) {
+                uint32_t start = (target > (uint32_t)(EDITOR_MAX_LINES / 2)) ?
+                                 target - (uint32_t)(EDITOR_MAX_LINES / 2) : 0;
+                if (editor_load_file_window(w, start) == 0) {
+                    uint32_t rel = target - w->editor_loaded_start_line;
+                    if (rel >= (uint32_t)w->editor_line_count) rel = (uint32_t)(w->editor_line_count - 1);
+                    w->editor_cursor_row = (int)rel;
+                    w->editor_cursor_col = 0;
+                    editor_scroll_to_cursor(w);
+                }
+            } else {
+                if (target >= (uint32_t)w->editor_line_count) target = (uint32_t)(w->editor_line_count - 1);
+                w->editor_cursor_row = (int)target;
+                w->editor_cursor_col = 0;
+                editor_scroll_to_cursor(w);
+            }
+        } else {
+            editor_set_status(w, "Unknown command");
+        }
     }
     if (w->active && w->kind == WINDOW_KIND_EDITOR) {
         w->editor_mode = 0;
@@ -552,7 +633,7 @@ void editor_render(struct Window *w, int x, int y, int ww, int wh) {
         
         // 1. 繪製行號
         char num_str[8];
-        lib_itoa((uint32_t)(row + 1), num_str);
+        lib_itoa(w->editor_loaded_start_line + (uint32_t)row + 1U, num_str);
         // 右對齊處理 (簡單版: 根據位數偏移)
         int num_len = 0; while(num_str[num_len]) num_len++;
         int num_offset = (4 - num_len) * char_w;
@@ -599,6 +680,15 @@ void editor_render(struct Window *w, int x, int y, int ww, int wh) {
         char status[EDITOR_STATUS_LEN + 32];
         if (w->editor_pending_d) lib_strcpy(status, "dd=delete line");
         else lib_strcpy(status, w->editor_status[0] ? w->editor_status : "i=insert  :wq=save+quit  :q=quit");
+        if (w->editor_lazy) {
+            char ln[12];
+            lib_strcat(status, "  lines ");
+            lib_itoa(w->editor_loaded_start_line + 1U, ln);
+            lib_strcat(status, ln);
+            lib_strcat(status, "-");
+            lib_itoa(w->editor_loaded_start_line + (uint32_t)w->editor_line_count, ln);
+            lib_strcat(status, ln);
+        }
         if (w->editor_dirty) lib_strcat(status, "  [modified]");
         draw_text(x + 10, status_y + 1, status, UI_C_TEXT);
     }

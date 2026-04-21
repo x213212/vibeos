@@ -292,6 +292,20 @@ int remove_entry_named(struct Window *w, const char *name) {
     return 0;
 }
 
+static int fs_dir_is_ancestor(uint32_t ancestor_bno, uint32_t child_bno) {
+    struct blk blkbuf;
+    struct dir_block *db;
+    int guard = 0;
+
+    while (child_bno != 0 && guard++ < 64) {
+        if (child_bno == ancestor_bno) return 1;
+        if (child_bno == 1) return 0;
+        if (fs_load_dir_block(child_bno, &blkbuf, &db) != 0) return 0;
+        child_bno = db->parent_bno ? db->parent_bno : 1;
+    }
+    return 0;
+}
+
 int move_entry_named(struct Window *w, const char *src_input, const char *dst_input) {
     uint32_t src_dir_bno = 0, dst_dir_bno = 0;
     char src_cwd[32];
@@ -322,6 +336,14 @@ int move_entry_named(struct Window *w, const char *src_input, const char *dst_in
 
     if (fs_load_dir_block(dst_dir_bno, &dst_blk, &dst_db) != 0) return -2;
     dst_idx = find_entry_index(dst_db, dst_leaf, -1);
+    if (dst_idx != -1 && dst_db->entries[dst_idx].type == 1) {
+        uint32_t existing_dir_bno = dst_db->entries[dst_idx].bno;
+        if (src_entry.type == 1 && fs_dir_is_ancestor(src_entry.bno, existing_dir_bno)) return -6;
+        dst_dir_bno = existing_dir_bno;
+        copy_name20(dst_leaf, src_leaf);
+        if (fs_load_dir_block(dst_dir_bno, &dst_blk, &dst_db) != 0) return -2;
+        dst_idx = find_entry_index(dst_db, dst_leaf, -1);
+    }
     if (src_dir_bno == dst_dir_bno) {
         if (dst_idx != -1 && dst_idx != src_idx) return -4;
         copy_name20(src_db->entries[src_idx].name, dst_leaf);

@@ -131,7 +131,9 @@ struct Window {
     char editor_lines[EDITOR_MAX_LINES][EDITOR_LINE_LEN];
     char editor_cmd[COLS];
     int editor_mode, editor_line_count, editor_cursor_row, editor_cursor_col;
-    int editor_scroll_row, editor_cmd_len, editor_cmd_cursor, editor_dirty, editor_pending_d;
+    int editor_scroll_row, editor_cmd_len, editor_cmd_cursor, editor_dirty, editor_pending_d, editor_readonly;
+    uint32_t editor_file_bno, editor_file_size, editor_loaded_start_line;
+    int editor_lazy, editor_loaded_complete;
     int ns_h_offset;
     int ns_input_active;
     int ns_resize_pending;
@@ -207,6 +209,7 @@ void close_window(int idx);
 void editor_set_status(struct Window *w, const char *msg);
 void editor_clear(struct Window *w);
 void editor_load_bytes(struct Window *w, const unsigned char *src, uint32_t size);
+int editor_load_file_window(struct Window *w, uint32_t start_line);
 void editor_handle_key(struct Window *w, char key);
 void editor_render(struct Window *w, int x, int y, int ww, int wh);
 int open_text_editor(struct Window *term, const char *name);

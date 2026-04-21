@@ -36,6 +36,7 @@ CFLAGS = -nostdlib -fno-builtin -mcmodel=medany -march=rv32imac -mabi=ilp32 -DLW
 
 OPT_FLAGS = -O2 -funroll-loops -ffast-math -ftree-vectorize -ffunction-sections -fdata-sections
 GDB = riscv64-unknown-elf-gdb
+BUILD_DIR = .build
 
 # NetSurf Core Libraries Sources
 NSFB_SOURCES = $(NSFB_DIR)/src/libnsfb.c $(NSFB_DIR)/src/surface/surface.c $(NSFB_DIR)/src/surface/ram.c \
@@ -143,18 +144,34 @@ ifeq ($(ENABLE_AUDIO),1)
 QFLAGS += -audiodev pa,id=snd0,server=unix:/mnt/wslg/PulseServer -device AC97,audiodev=snd0
 endif
 
-all: clean os.elf hdd.dsk qemu
+all: os.elf hdd.dsk qemu
 
-test: clean os.elf qemu
+test: os.elf qemu
 
-os.elf: $(OBJ) $(MBEDTLS_LIBS)
-	$(CC) $(CFLAGS) $(OPT_FLAGS) -Wl,--gc-sections -T os.ld -o os.elf $(OBJ) $(MBEDTLS_LIBS) -lgcc
+rebuild: clean os.elf
+
+ALL_SRCS = $(OBJ)
+OBJS = $(patsubst %.s,$(BUILD_DIR)/%.o,$(patsubst %.c,$(BUILD_DIR)/%.o,$(ALL_SRCS)))
+DEPS = $(OBJS:.o=.d)
+
+os.elf: $(OBJS) $(MBEDTLS_LIBS)
+	$(CC) $(CFLAGS) $(OPT_FLAGS) -Wl,--gc-sections -T os.ld -o os.elf $(OBJS) $(MBEDTLS_LIBS) -lgcc
+
+$(BUILD_DIR)/%.o: %.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(OPT_FLAGS) -MMD -MP -c $< -o $@
+
+$(BUILD_DIR)/%.o: %.s
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(OPT_FLAGS) -MMD -MP -c $< -o $@
+
+-include $(DEPS)
 
 qemu: os.elf hdd.dsk
 	$(QEMU) $(QFLAGS) -kernel os.elf
 
 clean:
-	rm -f *.elf *.img
+	rm -rf $(BUILD_DIR) *.elf *.img
 
 hdd.dsk:
 	dd if=/dev/urandom of=hdd.dsk bs=1M count=32
