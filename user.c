@@ -2422,6 +2422,120 @@ static void apply_resize(struct Window *w, int mx, int my) {
     }
 }
 
+static void refresh_window_after_geometry_change(struct Window *w) {
+    if (!w) return;
+    if (w->kind == WINDOW_KIND_TERMINAL) {
+        terminal_clamp_v_offset(w);
+    }
+    if (w->kind == WINDOW_KIND_NETSURF) {
+        w->v_offset = 0;
+        w->ns_h_offset = 0;
+        w->ns_input_active = 0;
+        w->ns_resize_pending = 1;
+        w->ns_resize_last_ms = sys_now();
+        extern void netsurf_invalidate_layout(int win_id);
+        netsurf_invalidate_layout(w->id);
+    }
+}
+
+static void maximize_window(int idx) {
+    if (idx < 0 || idx >= MAX_WINDOWS) return;
+    struct Window *w = &wins[idx];
+    if (!w->active || w->minimized) return;
+    if (!w->maximized) {
+        w->prev_x = w->x;
+        w->prev_y = w->y;
+        w->prev_w = w->w;
+        w->prev_h = w->h;
+        w->maximized = 1;
+    }
+    w->dragging = 0;
+    w->scroll_dragging = 0;
+    w->resizing = 0;
+    w->resize_dir = RESIZE_NONE;
+    refresh_window_after_geometry_change(w);
+}
+
+static void restore_window(int idx) {
+    if (idx < 0 || idx >= MAX_WINDOWS) return;
+    struct Window *w = &wins[idx];
+    if (!w->active) return;
+    w->minimized = 0;
+    if (w->maximized) {
+        w->x = w->prev_x;
+        w->y = w->prev_y;
+        w->w = w->prev_w;
+        w->h = w->prev_h;
+        w->maximized = 0;
+    }
+    w->dragging = 0;
+    w->scroll_dragging = 0;
+    w->resizing = 0;
+    w->resize_dir = RESIZE_NONE;
+    refresh_window_after_geometry_change(w);
+}
+
+static void minimize_window(int idx) {
+    if (idx < 0 || idx >= MAX_WINDOWS) return;
+    struct Window *w = &wins[idx];
+    if (!w->active) return;
+    w->minimized = 1;
+    w->dragging = 0;
+    w->scroll_dragging = 0;
+    w->resizing = 0;
+    w->resize_dir = RESIZE_NONE;
+    if (active_win_idx == idx) active_win_idx = -1;
+}
+
+static void snap_window_by_key(int idx, int key) {
+    if (idx < 0 || idx >= MAX_WINDOWS) return;
+    struct Window *w = &wins[idx];
+    if (!w->active || w->minimized) return;
+
+    if (!w->maximized) {
+        w->prev_x = w->x;
+        w->prev_y = w->y;
+        w->prev_w = w->w;
+        w->prev_h = w->h;
+    }
+
+    int half_w = WIDTH / 2;
+    int half_h = DESKTOP_H / 2;
+    int new_x = 0;
+    int new_y = 0;
+    int new_w = WIDTH;
+    int new_h = DESKTOP_H;
+
+    if (key == 0x12) {
+        new_w = half_w;
+        new_h = DESKTOP_H;
+    } else if (key == 0x13) {
+        new_x = half_w;
+        new_w = WIDTH - half_w;
+        new_h = DESKTOP_H;
+    } else if (key == 0x10) {
+        new_w = WIDTH;
+        new_h = half_h;
+    } else if (key == 0x11) {
+        new_y = half_h;
+        new_w = WIDTH;
+        new_h = DESKTOP_H - half_h;
+    } else {
+        return;
+    }
+
+    w->x = new_x;
+    w->y = new_y;
+    w->w = clamp_int(new_w, MIN_WIN_W, WIDTH);
+    w->h = clamp_int(new_h, MIN_WIN_H, DESKTOP_H);
+    w->maximized = 0;
+    w->dragging = 0;
+    w->scroll_dragging = 0;
+    w->resizing = 0;
+    w->resize_dir = RESIZE_NONE;
+    refresh_window_after_geometry_change(w);
+}
+
 void bring_to_front(int idx) {
     if (idx < 0 || idx >= MAX_WINDOWS) return;
     int p = -1; for(int i=0; i<MAX_WINDOWS; i++) if(z_order[i] == idx) { p = i; break; }
@@ -4241,7 +4355,24 @@ void gui_task(void) {
             redraw_needed = 1;
         }
         if (gui_key != 0 && active_window_valid()) {
-            if (wins[active_win_idx].kind == WINDOW_KIND_DEMO3D) {
+            int key_consumed = 0;
+            if (gui_ctrl_pressed && (gui_key == 0x10 || gui_key == 0x11 || gui_key == 0x12 || gui_key == 0x13)) {
+                snap_window_by_key(active_win_idx, gui_key);
+                gui_key = 0;
+                key_consumed = 1;
+            } else if (gui_ctrl_pressed && (gui_key == 'm' || gui_key == 'M')) {
+                maximize_window(active_win_idx);
+                gui_key = 0;
+                key_consumed = 1;
+            } else if (gui_ctrl_pressed && (gui_key == 'n' || gui_key == 'N')) {
+                restore_window(active_win_idx);
+                gui_key = 0;
+                key_consumed = 1;
+            } else if (gui_ctrl_pressed && (gui_key == 'b' || gui_key == 'B')) {
+                minimize_window(active_win_idx);
+                gui_key = 0;
+                key_consumed = 1;
+            } else if (wins[active_win_idx].kind == WINDOW_KIND_DEMO3D) {
                 handle_demo3d_input(&wins[active_win_idx], &gui_key);
             } else if (wins[active_win_idx].kind == WINDOW_KIND_FPS_GAME) {
                 handle_fps_input(&wins[active_win_idx], &gui_key, &redraw_needed);
@@ -4251,7 +4382,9 @@ void gui_task(void) {
                 window_input_push(&wins[active_win_idx], gui_key);
                 wins[active_win_idx].mailbox = 1;
             }
-            if (gui_key == 3 && wins[active_win_idx].kind == WINDOW_KIND_TERMINAL) {
+            if (key_consumed) {
+                gui_key = 0;
+            } else if (gui_key == 3 && wins[active_win_idx].kind == WINDOW_KIND_TERMINAL) {
                 if (wins[active_win_idx].has_selection) {
                     terminal_copy_selection(&wins[active_win_idx]);
                 } else if (wins[active_win_idx].executing_cmd || wins[active_win_idx].waiting_wget) {
