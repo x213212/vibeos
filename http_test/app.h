@@ -18,6 +18,18 @@
 #define APP_O_CREAT   0x100
 #define APP_O_TRUNC   0x200
 
+static inline __attribute__((noreturn)) void app_unreachable(void) {
+#if defined(__GNUC__) && !defined(__TINYC__)
+    __builtin_unreachable();
+#else
+    for (;;) {
+    }
+#endif
+}
+
+#ifdef __TINYC__
+long app_ecall(long a0, long a1, long a2, long a7);
+#else
 static inline long app_ecall(long a0, long a1, long a2, long a7) {
     register long ra0 asm("a0") = a0;
     register long ra1 asm("a1") = a1;
@@ -29,6 +41,7 @@ static inline long app_ecall(long a0, long a1, long a2, long a7) {
                  : "memory");
     return ra0;
 }
+#endif
 
 static inline void app_putc(char c) {
     app_ecall((long)c, 0, 0, APP_SYS_PUTC);
@@ -88,7 +101,7 @@ static inline void app_yield(void) {
 
 static inline __attribute__((noreturn)) void app_exit(int code) {
     app_ecall((long)code, 0, 0, APP_SYS_EXIT);
-    __builtin_unreachable();
+    app_unreachable();
 }
 
 #endif

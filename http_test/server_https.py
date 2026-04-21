@@ -2,19 +2,11 @@ from pathlib import Path
 import os
 import ssl
 
-from flask import send_file
 from server import app
 
 BASE_DIR = Path(__file__).resolve().parent
 CERT_FILE = BASE_DIR / "server.crt"
 KEY_FILE = BASE_DIR / "server.key"
-LEZ_GB_PATH = BASE_DIR / "lez.gb"
-
-
-@app.route("/lez.gb")
-@app.route("/download/lez.gb")
-def download_lez_gb_https():
-    return send_file(LEZ_GB_PATH, as_attachment=True, download_name="lez.gb")
 
 
 if __name__ == "__main__":

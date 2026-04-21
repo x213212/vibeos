@@ -1,71 +1,33 @@
 from pathlib import Path
-from flask import Flask, send_file
+from flask import Flask, abort, send_file, send_from_directory
 import os
 
 app = Flask(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent
-FILE_PATH = BASE_DIR / "test.bmp"
-BIN_PATH = BASE_DIR / "test.bin"
-ELF_PATH = BASE_DIR / "hello.elf"
-FAULT_BIN_PATH = BASE_DIR / "fault.bin"
-WRITEFAULT_BIN_PATH = BASE_DIR / "writefault.bin"
-JUMPFAULT_BIN_PATH = BASE_DIR / "jumpfault.bin"
-SELFMEM_BIN_PATH = BASE_DIR / "selfmem.bin"
-LEZ_GB_PATH = BASE_DIR / "lez.gb"
+BLOCKED_DOWNLOADS = {"server.key"}
 
 
 @app.route("/")
 def index():
-    return "OK\n"
+    names = []
+    for path in sorted(BASE_DIR.iterdir()):
+        if path.is_file() and path.name not in BLOCKED_DOWNLOADS:
+            names.append(path.name)
+    return "OK\n" + "\n".join(names) + ("\n" if names else "")
 
 
-@app.route("/test.html")
-def download_test_html():
-    return send_file(BASE_DIR / "test.html", mimetype="text/html")
-
-
-@app.route("/test.bmp")
-@app.route("/download")
-def download_file():
-    return send_file(FILE_PATH, as_attachment=True, download_name="test.bmp")
-
-
-@app.route("/test.bin")
-@app.route("/download.bin")
-def download_bin():
-    return send_file(ELF_PATH, as_attachment=True, download_name="test.bin")
-
-
-@app.route("/lez.gb")
-@app.route("/download/lez.gb")
-def download_lez_gb():
-    return send_file(LEZ_GB_PATH, as_attachment=True, download_name="lez.gb")
-
-
-@app.route("/hello.elf")
-def download_elf():
-    return send_file(ELF_PATH, as_attachment=True, download_name="hello.elf")
-
-
-@app.route("/fault.bin")
-def download_fault_bin():
-    return send_file(FAULT_BIN_PATH, as_attachment=True, download_name="fault.bin")
-
-
-@app.route("/writefault.bin")
-def download_writefault_bin():
-    return send_file(WRITEFAULT_BIN_PATH, as_attachment=True, download_name="writefault.bin")
-
-
-@app.route("/jumpfault.bin")
-def download_jumpfault_bin():
-    return send_file(JUMPFAULT_BIN_PATH, as_attachment=True, download_name="jumpfault.bin")
-
-
-@app.route("/selfmem.bin")
-def download_selfmem_bin():
-    return send_file(SELFMEM_BIN_PATH, as_attachment=True, download_name="selfmem.bin")
+@app.route("/download/<path:filename>")
+@app.route("/<path:filename>")
+def download_file(filename):
+    path = (BASE_DIR / filename).resolve()
+    if BASE_DIR not in path.parents and path != BASE_DIR:
+        abort(404)
+    if not path.is_file() or path.name in BLOCKED_DOWNLOADS:
+        abort(404)
+    if path.suffix == ".html":
+        return send_file(path, mimetype="text/html")
+    return send_from_directory(BASE_DIR, filename, as_attachment=True, download_name=path.name)
 
 
 if __name__ == "__main__":

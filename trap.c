@@ -90,6 +90,8 @@ reg_t trap_handler(reg_t epc, reg_t cause, reg_t frame) {
             extern int loaded_app_exit_code;
             loaded_app_exit_code = (int)regs[9];
             regs[1] = app_exit_stack_top();
+            w_satp(0);
+            sfence_vma();
             w_mstatus((r_mstatus() & ~MSTATUS_MPP_MASK) | MSTATUS_MPP_M);
             return_pc = app_exit_resume_pc();
             advance_pc = 0;
