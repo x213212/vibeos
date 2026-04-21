@@ -112,7 +112,7 @@ struct Window {
     int resizing, resize_dir;
     int resize_start_mx, resize_start_my, resize_start_x, resize_start_y, resize_start_w, resize_start_h;
     char lines[ROWS][COLS]; int total_rows, cur_col, v_offset;
-    char mailbox, title[24], cmd_buf[COLS], cwd[128];
+    char mailbox, title[64], cmd_buf[COLS], cwd[128];
     char input_q[INPUT_MAILBOX_SIZE];
     int input_head, input_tail;
     uint32_t cwd_bno; char history[MAX_HIST][COLS]; int hist_count, hist_idx;

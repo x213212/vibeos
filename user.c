@@ -106,20 +106,20 @@ static void build_editor_path(char *dst, const char *cwd, const char *name) {
     if (!dst) return;
     dst[0] = '\0';
     if (cwd && cwd[0]) {
-        while (cwd[i] && pos < 63) {
+        while (cwd[i] && pos < 127) {
             dst[pos++] = cwd[i++];
         }
     } else {
         const char *root = "/root";
-        while (root[i] && pos < 63) {
+        while (root[i] && pos < 127) {
             dst[pos++] = root[i++];
         }
     }
-    if (pos > 0 && dst[pos - 1] != '/' && pos < 63) {
+    if (pos > 0 && dst[pos - 1] != '/' && pos < 127) {
         dst[pos++] = '/';
     }
     i = 0;
-    while (name && name[i] && pos < 63) {
+    while (name && name[i] && pos < 127) {
         dst[pos++] = name[i++];
     }
     dst[pos] = '\0';
@@ -2039,21 +2039,31 @@ static int open_image_file(struct Window *term, const char *name) {
 int open_text_editor(struct Window *term, const char *name) {
     uint32_t size = 0;
     int rc = -1;
-    char display_name[20];
+    char display_name[64];
     char requested[64];
-    char absolute_path[64];
+    char absolute_path[128];
     uint32_t dir_bno = term ? term->cwd_bno : 1;
-    char cwd_copy[128]; // Increased to 128
-    char leaf[20];
+    char cwd_copy[128];
+    char leaf[32];
     int use_resolve = 0;
 
     if (!term) return -1;
     if (!name || name[0] == '\0') return -1;
-    copy_name20(requested, name);
+
+    // Clear all local buffers
+    memset(leaf, 0, sizeof(leaf));
+    memset(absolute_path, 0, sizeof(absolute_path));
+    memset(display_name, 0, sizeof(display_name));
+    memset(requested, 0, sizeof(requested));
+    memset(cwd_copy, 0, sizeof(cwd_copy));
+    
+    strncpy(requested, name, sizeof(requested)-1);
+
     if (strchr(requested, '/') || strstr(requested, "..") || requested[0] == '~') use_resolve = 1;
     lib_strcpy(cwd_copy, term->cwd[0] ? term->cwd : "/root");
-    copy_name20(display_name, path_basename(requested));
-    if (display_name[0] == '\0') copy_name20(display_name, requested);
+    
+    // Default absolute path construction
+    build_editor_path(absolute_path, cwd_copy, requested);
 
     if (use_resolve && resolve_editor_target(term, name, &dir_bno, cwd_copy, leaf) == 0) {
         extern struct Window fs_tmp_window;
@@ -2062,54 +2072,36 @@ int open_text_editor(struct Window *term, const char *name) {
         load_ctx->cwd_bno = dir_bno;
         lib_strcpy(load_ctx->cwd, cwd_copy);
         rc = load_file_bytes(load_ctx, leaf, file_io_buf, sizeof(file_io_buf), &size);
+        build_editor_path(absolute_path, cwd_copy, leaf);
+        strncpy(display_name, leaf, sizeof(display_name)-1);
     } else {
         rc = load_file_bytes(term, requested, file_io_buf, sizeof(file_io_buf), &size);
+        const char *base = path_basename(requested);
+        strncpy(display_name, base, sizeof(display_name)-1);
     }
+    
     if (rc == -3) return -4;
-    if (display_name[0] == '\0') copy_name20(display_name, requested);
-
-    absolute_path[0] = '\0';
-    if (dir_bno != 0) {
-        if (leaf[0] != '\0') build_editor_path(absolute_path, cwd_copy, leaf);
-        else lib_strcpy(absolute_path, cwd_copy[0] ? cwd_copy : (term->cwd[0] ? term->cwd : "/root"));
-    }
-    if (absolute_path[0] == '\0') {
-        build_editor_path(absolute_path, term->cwd[0] ? term->cwd : "/root", requested);
-    }
 
     for (int i = 0; i < MAX_WINDOWS; i++) {
         if (wins[i].active) continue;
         reset_window(&wins[i], i);
         wins[i].active = 1;
-        wins[i].minimized = 0;
         wins[i].kind = WINDOW_KIND_EDITOR;
-        wins[i].x = 120;
-        wins[i].y = 70;
-        wins[i].w = WIDTH - 160;
-        wins[i].h = DESKTOP_H - 120;
-        if (wins[i].w < 320) wins[i].w = 320;
-        if (wins[i].h < 220) wins[i].h = 220;
-        if (wins[i].w > WIDTH) wins[i].w = WIDTH;
-        if (wins[i].h > DESKTOP_H) wins[i].h = DESKTOP_H;
-        wins[i].prev_x = wins[i].x;
-        wins[i].prev_y = wins[i].y;
-        wins[i].prev_w = wins[i].w;
-        wins[i].prev_h = wins[i].h;
         wins[i].maximized = 1;
-        wins[i].x = 0;
-        wins[i].y = 0;
-        wins[i].w = WIDTH;
-        wins[i].h = DESKTOP_H;
-        copy_name20(wins[i].editor_name, display_name);
-        lib_strcpy(wins[i].editor_cwd, cwd_copy[0] ? cwd_copy : (term->cwd[0] ? term->cwd : "/root"));
-        wins[i].cwd_bno = dir_bno ? dir_bno : (term->cwd_bno ? term->cwd_bno : 1);
+        wins[i].x = 0; wins[i].y = 0; wins[i].w = WIDTH; wins[i].h = DESKTOP_H;
+        
+        strncpy(wins[i].editor_name, display_name, 19);
+        lib_strcpy(wins[i].editor_path, absolute_path);
+        lib_strcpy(wins[i].editor_cwd, cwd_copy[0] ? cwd_copy : "/root");
+        wins[i].cwd_bno = dir_bno ? dir_bno : 1;
+        
         if (rc == 0) editor_load_bytes(&wins[i], file_io_buf, size);
         else editor_clear(&wins[i]);
-        copy_name20(wins[i].editor_path, absolute_path);
-        if (wins[i].editor_path[0] == '\0') build_editor_path(wins[i].editor_path, wins[i].editor_cwd, wins[i].editor_name);
+        
         memset(wins[i].title, 0, sizeof(wins[i].title));
         lib_strcpy(wins[i].title, "Vim: ");
-        shorten_path_for_title(wins[i].title + 5, wins[i].editor_path, 18);
+        shorten_path_for_title(wins[i].title + 5, wins[i].editor_path, 55);
+        
         editor_set_status(&wins[i], "i=insert  :wq=save+quit  :q=quit");
         bring_to_front(i);
         return 0;
@@ -3482,9 +3474,9 @@ void draw_window(struct Window *w) {
     draw_vertical_gradient(x + 3, y + 3, ww - 6, 10, title_top, title_bot);
     int title_max = (ww - 110) / 8;
     if (title_max < 6) title_max = 6;
-    if (title_max > 22) title_max = 22;
+    if (title_max > 60) title_max = 60;
     if (w->kind == WINDOW_KIND_TERMINAL) {
-        char title[32];
+        char title[80];
         lib_strcpy(title, w->title);
         lib_strcat(title, " [x");
         char num[4];
@@ -3494,7 +3486,7 @@ void draw_window(struct Window *w) {
         title[title_max] = '\0';
         draw_text(x + 10, y + 6, title, UI_C_TEXT);
     } else if (w->kind == WINDOW_KIND_DEMO3D) {
-        char title[40];
+        char title[80];
         char num[12];
         lib_strcpy(title, w->title);
         lib_strcat(title, " [");
@@ -3504,7 +3496,7 @@ void draw_window(struct Window *w) {
         title[title_max] = '\0';
         draw_text(x + 10, y + 6, title, UI_C_TEXT);
     } else {
-        char title[32];
+        char title[80];
         lib_strcpy(title, w->title);
         title[title_max] = '\0';
         draw_text(x + 10, y + 6, title, UI_C_TEXT);
