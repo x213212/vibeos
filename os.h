@@ -38,7 +38,11 @@ extern void free(void *p);
 extern int appfs_open(const char *path, int flags);
 extern int appfs_read(int fd, void *buf, size_t size);
 extern int appfs_write(int fd, const void *buf, size_t size);
+extern int appfs_seek(int fd, int offset, int whence);
+extern int appfs_tell(int fd);
+extern int appfs_unlink(const char *path);
 extern int appfs_close(int fd);
 extern int appfs_close_all(void);
+extern void appfs_set_cwd(uint32_t cwd_bno, const char *cwd);
 
 #endif

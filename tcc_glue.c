@@ -58,10 +58,35 @@ int sem_wait(int *sem) { return 0; }
 int sem_post(int *sem) { return 0; }
 
 // --- 檔案系統 (對接到 appfs，確保符號可見) ---
+static int jit_stdio_mode_to_flags(const char *mode) {
+    int plus = 0;
+    char base;
+    if (!mode || !mode[0]) return -1;
+    base = mode[0];
+    for (const char *p = mode; *p; p++) {
+        if (*p == '+') plus = 1;
+    }
+    if (base == 'r') return plus ? (0x01 | 0x02) : 0x01;
+    if (base == 'w') return plus ? (0x01 | 0x02 | 0x100 | 0x200) : (0x02 | 0x100 | 0x200);
+    if (base == 'a') return plus ? (0x01 | 0x02 | 0x100) : (0x02 | 0x100);
+    return -1;
+}
+
 void *fopen(const char *path, const char *mode) {
-    int fd = appfs_open(path, 1); // 1 = READ
+    int flags = jit_stdio_mode_to_flags(mode);
+    int fd;
+    if (flags < 0) return NULL;
+    fd = appfs_open(path, flags);
     if (fd < 0) return NULL;
+    if (mode && mode[0] == 'a' && appfs_seek(fd, 0, SEEK_END) < 0) {
+        appfs_close(fd);
+        return NULL;
+    }
     int *pfd = malloc(sizeof(int));
+    if (!pfd) {
+        appfs_close(fd);
+        return NULL;
+    }
     *pfd = fd;
     return (void*)pfd;
 }
@@ -76,14 +101,28 @@ size_t fread(void *ptr, size_t size, size_t nmemb, void *fp) {
     int rc = appfs_read(*(int*)fp, ptr, size * nmemb);
     return (rc > 0) ? (size_t)rc / size : 0;
 }
+size_t fwrite(const void *ptr, size_t size, size_t nmemb, void *fp) {
+    if (!fp) return 0;
+    int rc = appfs_write(*(int*)fp, ptr, size * nmemb);
+    return (rc > 0) ? (size_t)rc / size : 0;
+}
+int fseek(void *fp, long offset, int whence) {
+    if (!fp) return -1;
+    return appfs_seek(*(int*)fp, (int)offset, whence) < 0 ? -1 : 0;
+}
+long ftell(void *fp) {
+    if (!fp) return -1;
+    return (long)appfs_tell(*(int*)fp);
+}
 
 // 基礎系統調用
 int open(const char *pathname, int flags, ...) { return appfs_open(pathname, flags); }
 int close(int fd) { return appfs_close(fd); }
 ssize_t read(int fd, void *buf, size_t count) { return appfs_read(fd, buf, count); }
 ssize_t write(int fd, const void *buf, size_t count) { return appfs_write(fd, buf, count); }
-off_t lseek(int fd, off_t offset, int whence) { return 0; }
-int unlink(const char *pathname) { return -1; }
+off_t lseek(int fd, off_t offset, int whence) { return (off_t)appfs_seek(fd, (int)offset, whence); }
+int unlink(const char *pathname) { return appfs_unlink(pathname); }
+int remove(const char *pathname) { return appfs_unlink(pathname); }
 int getpagesize(void) { return 4096; }
 void *mmap(void *addr, size_t length, int prot, int flags, int fd, size_t offset) { return malloc(length); }
 int munmap(void *addr, size_t length) { free(addr); return 0; }
@@ -108,6 +147,9 @@ void tcc_error_report(void *opaque, const char *msg) { lib_printf("TCC Error: %s
 #define JIT_MAX_KPTRS 32
 #define JIT_MAX_FDS 32
 #define JIT_TIMESLICE_MS 10u
+#define JIT_INCLUDE_MAX_DEPTH 16
+#define JIT_SOURCE_MAX_SIZE (512u * 1024u)
+#define JIT_SEEN_MAX 64
 
 enum {
     JIT_JOB_EMPTY = 0,
@@ -148,6 +190,12 @@ static uint8_t jit_shared_area[JIT_SHARED_SIZE];
 static struct jit_job jit_jobs[JIT_MAX_JOBS];
 static int jit_next_id = 1;
 static int jit_initialized = 0;
+
+struct jit_source_buf {
+    char *data;
+    size_t len;
+    size_t cap;
+};
 
 void os_jit_init(void);
 static void jit_yield(void);
@@ -361,6 +409,17 @@ static int jit_appfs_write(int fd, const void *buf, size_t size) {
     return rc;
 }
 
+static int jit_appfs_seek(int fd, int offset, int whence) {
+    if (jit_check_cancel()) return -1;
+    jit_maybe_yield();
+    return appfs_seek(fd, offset, whence);
+}
+
+static int jit_appfs_tell(int fd) {
+    if (jit_check_cancel()) return -1;
+    return appfs_tell(fd);
+}
+
 static void jit_uheap_reset(struct jit_job *job) {
     if (!job || !job->uheap) return;
     job->uheap_head = (struct jit_ublock *)job->uheap;
@@ -507,11 +566,21 @@ static const char jit_prelude[] =
     "typedef unsigned int size_t;\n"
     "typedef unsigned int uint32_t;\n"
     "typedef unsigned char uint8_t;\n"
+    "typedef struct __FILE FILE;\n"
+    "enum { SEEK_SET = 0, SEEK_CUR = 1, SEEK_END = 2 };\n"
     "int printf(const char *fmt, ...);\n"
     "int print(const char *fmt, ...);\n"
     "int puts(const char *s);\n"
     "int putchar(int c);\n"
     "int snprintf(char *out, size_t n, const char *fmt, ...);\n"
+    "FILE *fopen(const char *pathname, const char *mode);\n"
+    "int fclose(FILE *stream);\n"
+    "size_t fread(void *ptr, size_t size, size_t nmemb, FILE *stream);\n"
+    "size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream);\n"
+    "int fseek(FILE *stream, long offset, int whence);\n"
+    "long ftell(FILE *stream);\n"
+    "int unlink(const char *pathname);\n"
+    "int remove(const char *pathname);\n"
     "void *umalloc(size_t size);\n"
     "void ufree(void *p);\n"
     "void *ucalloc(uint32_t nmemb, uint32_t size);\n"
@@ -561,7 +630,11 @@ static const char jit_prelude[] =
     "int appfs_open(const char *path, int flags);\n"
     "int appfs_read(int fd, void *buf, size_t size);\n"
     "int appfs_write(int fd, const void *buf, size_t size);\n"
+    "int appfs_seek(int fd, int offset, int whence);\n"
+    "int appfs_tell(int fd);\n"
+    "int appfs_unlink(const char *path);\n"
     "int appfs_close(int fd);\n"
+    "enum { APP_O_READ = 0x01, APP_O_WRITE = 0x02, APP_O_CREAT = 0x100, APP_O_TRUNC = 0x200 };\n"
     "enum { WIDTH = 1024, HEIGHT = 768 };\n";
 
 enum jit_instrument_state {
@@ -784,10 +857,26 @@ static void jit_add_os_symbols(TCCState *s) {
     jit_add_symbol_logged(s, "clipboard_get", (void*)clipboard_get);
     jit_add_symbol_logged(s, "clipboard_set", (void*)clipboard_set);
 
-    jit_add_symbol_logged(s, "appfs_open", (void*)jit_appfs_open);
+    jit_add_symbol_logged(s, "fopen", (void*)fopen);
+    jit_add_symbol_logged(s, "fclose", (void*)fclose);
+    jit_add_symbol_logged(s, "fread", (void*)fread);
+    jit_add_symbol_logged(s, "fwrite", (void*)fwrite);
+    jit_add_symbol_logged(s, "fseek", (void*)fseek);
+    jit_add_symbol_logged(s, "ftell", (void*)ftell);
+    jit_add_symbol_logged(s, "unlink", (void*)unlink);
+    jit_add_symbol_logged(s, "remove", (void*)remove);
+    jit_add_symbol_logged(s, "open", (void*)open);
+    jit_add_symbol_logged(s, "close", (void*)close);
+    jit_add_symbol_logged(s, "read", (void*)read);
+    jit_add_symbol_logged(s, "write", (void*)write);
+    jit_add_symbol_logged(s, "lseek", (void*)lseek);
 
+    jit_add_symbol_logged(s, "appfs_open", (void*)jit_appfs_open);
     jit_add_symbol_logged(s, "appfs_read", (void*)jit_appfs_read);
     jit_add_symbol_logged(s, "appfs_write", (void*)jit_appfs_write);
+    jit_add_symbol_logged(s, "appfs_seek", (void*)jit_appfs_seek);
+    jit_add_symbol_logged(s, "appfs_tell", (void*)jit_appfs_tell);
+    jit_add_symbol_logged(s, "appfs_unlink", (void*)appfs_unlink);
     jit_add_symbol_logged(s, "appfs_close", (void*)jit_appfs_close);
 }
 
@@ -819,6 +908,327 @@ static const char *jit_state_name(int state) {
     case JIT_JOB_FAILED: return "failed";
     default: return "?";
     }
+}
+
+static int jit_source_buf_reserve(struct jit_source_buf *buf, size_t need) {
+    if (!buf) return -1;
+    if (need <= buf->cap) return 0;
+    size_t new_cap = buf->cap ? buf->cap : 1024u;
+    while (new_cap < need) new_cap *= 2u;
+    if (new_cap > JIT_SOURCE_MAX_SIZE) new_cap = JIT_SOURCE_MAX_SIZE;
+    if (new_cap < need) return -1;
+    char *np = (char *)realloc(buf->data, new_cap);
+    if (!np) return -1;
+    buf->data = np;
+    buf->cap = new_cap;
+    return 0;
+}
+
+static int jit_source_buf_append_n(struct jit_source_buf *buf, const char *s, size_t n) {
+    if (!buf || !s) return -1;
+    if (buf->len + n + 1 > JIT_SOURCE_MAX_SIZE) return -1;
+    if (jit_source_buf_reserve(buf, buf->len + n + 1) != 0) return -1;
+    memcpy(buf->data + buf->len, s, n);
+    buf->len += n;
+    buf->data[buf->len] = '\0';
+    return 0;
+}
+
+static int jit_source_buf_append(struct jit_source_buf *buf, const char *s) {
+    return jit_source_buf_append_n(buf, s, s ? strlen(s) : 0);
+}
+
+static int jit_path_dirname(const char *path, char *out, size_t out_size) {
+    size_t len = 0;
+    size_t slash = 0;
+    if (!path || !out || out_size == 0) return -1;
+    while (path[len]) {
+        if (path[len] == '/') slash = len;
+        len++;
+    }
+    if (slash == 0) {
+        if (path[0] == '/') {
+            if (out_size < 2) return -1;
+            out[0] = '/';
+            out[1] = '\0';
+            return 0;
+        }
+        if (out_size < 6) return -1;
+        strcpy(out, "/root");
+        return 0;
+    }
+    if (slash + 1 >= out_size) return -1;
+    memcpy(out, path, slash);
+    out[slash] = '\0';
+    return 0;
+}
+
+static int jit_path_join(char *out, size_t out_size, const char *base_dir, const char *name) {
+    size_t pos = 0;
+    size_t i = 0;
+    if (!out || out_size == 0 || !name || !name[0]) return -1;
+    if (name[0] == '/') {
+        while (name[i] && pos + 1 < out_size) out[pos++] = name[i++];
+        out[pos] = '\0';
+        return name[i] ? -1 : 0;
+    }
+    if (!base_dir || !base_dir[0]) base_dir = "/root";
+    while (base_dir[i] && pos + 1 < out_size) out[pos++] = base_dir[i++];
+    if (pos == 0 || out[pos - 1] != '/') {
+        if (pos + 1 >= out_size) return -1;
+        out[pos++] = '/';
+    }
+    i = 0;
+    while (name[i] && pos + 1 < out_size) out[pos++] = name[i++];
+    out[pos] = '\0';
+    return name[i] ? -1 : 0;
+}
+
+static int jit_read_text_file(const char *path, char **out, size_t *out_size, char *msg, size_t msg_size) {
+    int fd = -1;
+    struct jit_source_buf buf;
+    char tmp[512];
+    int rc = 0;
+    if (msg && msg_size) msg[0] = '\0';
+    if (!path || !out) return -1;
+    *out = NULL;
+    if (out_size) *out_size = 0;
+    memset(&buf, 0, sizeof(buf));
+    fd = appfs_open(path, 1);
+    if (fd < 0) {
+        if (msg && msg_size) snprintf(msg, msg_size, "JIT: open failed: %s", path);
+        return -1;
+    }
+    while (1) {
+        int n = appfs_read(fd, tmp, sizeof(tmp));
+        if (n < 0) {
+            rc = -1;
+            if (msg && msg_size) snprintf(msg, msg_size, "JIT: read failed: %s", path);
+            break;
+        }
+        if (n == 0) break;
+        if (jit_source_buf_append_n(&buf, tmp, (size_t)n) != 0) {
+            rc = -1;
+            if (msg && msg_size) snprintf(msg, msg_size, "JIT: source too large: %s", path);
+            break;
+        }
+    }
+    appfs_close(fd);
+    if (rc != 0) {
+        free(buf.data);
+        return -1;
+    }
+    if (!buf.data) {
+        buf.data = (char *)malloc(1);
+        if (!buf.data) {
+            if (msg && msg_size) snprintf(msg, msg_size, "JIT: alloc failed");
+            return -1;
+        }
+        buf.data[0] = '\0';
+    }
+    *out = buf.data;
+    if (out_size) *out_size = buf.len;
+    return 0;
+}
+
+static int jit_line_is_local_include(const char *line, size_t len, char *name, size_t name_size) {
+    size_t i = 0;
+    size_t j = 0;
+    if (!line || !name || name_size == 0) return 0;
+    while (i < len && (line[i] == ' ' || line[i] == '\t')) i++;
+    if (i >= len || line[i] != '#') return 0;
+    i++;
+    while (i < len && (line[i] == ' ' || line[i] == '\t')) i++;
+    if (i + 7 > len || strncmp(line + i, "include", 7) != 0) return 0;
+    i += 7;
+    while (i < len && (line[i] == ' ' || line[i] == '\t')) i++;
+    if (i >= len || line[i] != '"') return 0;
+    i++;
+    while (i < len && line[i] != '"' && j + 1 < name_size) name[j++] = line[i++];
+    if (i >= len || line[i] != '"') return 0;
+    name[j] = '\0';
+    return name[0] != '\0';
+}
+
+static int jit_stack_contains(const char **stack, int depth, const char *path) {
+    for (int i = 0; i < depth; i++) {
+        if (stack[i] && strcmp(stack[i], path) == 0) return 1;
+    }
+    return 0;
+}
+
+static int jit_seen_contains(char seen[JIT_SEEN_MAX][256], int seen_count, const char *path) {
+    for (int i = 0; i < seen_count; i++) {
+        if (seen[i][0] && strcmp(seen[i], path) == 0) return 1;
+    }
+    return 0;
+}
+
+static int jit_seen_add(char seen[JIT_SEEN_MAX][256], int *seen_count, const char *path) {
+    if (!seen || !seen_count || !path || !path[0]) return -1;
+    if (jit_seen_contains(seen, *seen_count, path)) return 0;
+    if (*seen_count >= JIT_SEEN_MAX) return -1;
+    strncpy(seen[*seen_count], path, sizeof(seen[*seen_count]) - 1);
+    seen[*seen_count][sizeof(seen[*seen_count]) - 1] = '\0';
+    (*seen_count)++;
+    return 0;
+}
+
+static int jit_header_to_source_path(char *out, size_t out_size, const char *header_path) {
+    size_t len = 0;
+    if (!out || out_size == 0 || !header_path) return -1;
+    len = strlen(header_path);
+    if (len < 3 || out_size <= len) return -1;
+    if (strcmp(header_path + len - 2, ".h") != 0) return -1;
+    memcpy(out, header_path, len - 2);
+    out[len - 2] = '.';
+    out[len - 1] = 'c';
+    out[len] = '\0';
+    return 0;
+}
+
+static int jit_expand_source_recursive(struct jit_source_buf *out,
+                                       const char *source,
+                                       const char *base_dir,
+                                       const char **stack,
+                                       int depth,
+                                       char seen[JIT_SEEN_MAX][256],
+                                       int *seen_count,
+                                       char *msg,
+                                       size_t msg_size) {
+    size_t pos = 0;
+    int in_block_comment = 0;
+    if (!out || !source || !base_dir) return -1;
+    if (depth >= JIT_INCLUDE_MAX_DEPTH) {
+        if (msg && msg_size) snprintf(msg, msg_size, "JIT: include depth exceeded");
+        return -1;
+    }
+    while (source[pos]) {
+        size_t line_start = pos;
+        size_t line_len = 0;
+        char inc_name[128];
+        while (source[pos] && source[pos] != '\n') pos++;
+        line_len = pos - line_start;
+        if (!in_block_comment && jit_line_is_local_include(source + line_start, line_len, inc_name, sizeof(inc_name))) {
+            char inc_path[256];
+            char inc_dir[256];
+            char auto_src_path[256];
+            char *inc_src = NULL;
+            char *auto_src = NULL;
+            if (jit_path_join(inc_path, sizeof(inc_path), base_dir, inc_name) != 0) {
+                if (msg && msg_size) snprintf(msg, msg_size, "JIT: bad include path: %s", inc_name);
+                return -1;
+            }
+            if (jit_stack_contains(stack, depth, inc_path)) {
+                if (msg && msg_size) snprintf(msg, msg_size, "JIT: recursive include: %s", inc_path);
+                return -1;
+            }
+            if (!jit_seen_contains(seen, seen_count ? *seen_count : 0, inc_path)) {
+                if (jit_read_text_file(inc_path, &inc_src, NULL, msg, msg_size) != 0) return -1;
+                if (jit_path_dirname(inc_path, inc_dir, sizeof(inc_dir)) != 0) {
+                    free(inc_src);
+                    if (msg && msg_size) snprintf(msg, msg_size, "JIT: bad include dir: %s", inc_path);
+                    return -1;
+                }
+                if (jit_seen_add(seen, seen_count, inc_path) != 0) {
+                    free(inc_src);
+                    if (msg && msg_size) snprintf(msg, msg_size, "JIT: include cache full");
+                    return -1;
+                }
+                stack[depth] = inc_path;
+                if (jit_expand_source_recursive(out, inc_src, inc_dir, stack, depth + 1, seen, seen_count, msg, msg_size) != 0) {
+                    free(inc_src);
+                    return -1;
+                }
+                stack[depth] = NULL;
+                free(inc_src);
+            }
+            if (jit_header_to_source_path(auto_src_path, sizeof(auto_src_path), inc_path) == 0 &&
+                !jit_seen_contains(seen, seen_count ? *seen_count : 0, auto_src_path)) {
+                if (jit_read_text_file(auto_src_path, &auto_src, NULL, NULL, 0) == 0 && auto_src) {
+                    if (jit_path_dirname(auto_src_path, inc_dir, sizeof(inc_dir)) != 0) {
+                        free(auto_src);
+                        if (msg && msg_size) snprintf(msg, msg_size, "JIT: bad source dir: %s", auto_src_path);
+                        return -1;
+                    }
+                    if (jit_seen_add(seen, seen_count, auto_src_path) != 0) {
+                        free(auto_src);
+                        if (msg && msg_size) snprintf(msg, msg_size, "JIT: include cache full");
+                        return -1;
+                    }
+                    stack[depth] = auto_src_path;
+                    if (jit_expand_source_recursive(out, auto_src, inc_dir, stack, depth + 1, seen, seen_count, msg, msg_size) != 0) {
+                        free(auto_src);
+                        return -1;
+                    }
+                    stack[depth] = NULL;
+                    free(auto_src);
+                }
+            }
+        } else {
+            if (jit_source_buf_append_n(out, source + line_start, line_len) != 0) {
+                if (msg && msg_size) snprintf(msg, msg_size, "JIT: expanded source too large");
+                return -1;
+            }
+        }
+        if (source[pos] == '\n') {
+            if (jit_source_buf_append_n(out, "\n", 1) != 0) {
+                if (msg && msg_size) snprintf(msg, msg_size, "JIT: expanded source too large");
+                return -1;
+            }
+            pos++;
+        }
+        for (size_t i = line_start; i < line_start + line_len; i++) {
+            if (!in_block_comment && source[i] == '/' && source[i + 1] == '*') {
+                in_block_comment = 1;
+                i++;
+            } else if (in_block_comment && source[i] == '*' && source[i + 1] == '/') {
+                in_block_comment = 0;
+                i++;
+            }
+        }
+    }
+    return 0;
+}
+
+static char *jit_load_source_from_path(const char *path, char *msg, size_t msg_size) {
+    char *src = NULL;
+    char dir[256];
+    struct jit_source_buf out;
+    const char *stack[JIT_INCLUDE_MAX_DEPTH];
+    char seen[JIT_SEEN_MAX][256];
+    int seen_count = 0;
+    memset(&out, 0, sizeof(out));
+    memset(stack, 0, sizeof(stack));
+    memset(seen, 0, sizeof(seen));
+    if (msg && msg_size) msg[0] = '\0';
+    if (jit_read_text_file(path, &src, NULL, msg, msg_size) != 0) return NULL;
+    if (jit_path_dirname(path, dir, sizeof(dir)) != 0) {
+        free(src);
+        if (msg && msg_size) snprintf(msg, msg_size, "JIT: bad source path");
+        return NULL;
+    }
+    stack[0] = path;
+    if (jit_seen_add(seen, &seen_count, path) != 0) {
+        free(src);
+        if (msg && msg_size) snprintf(msg, msg_size, "JIT: include cache full");
+        return NULL;
+    }
+    if (jit_expand_source_recursive(&out, src, dir, stack, 1, seen, &seen_count, msg, msg_size) != 0) {
+        free(src);
+        free(out.data);
+        return NULL;
+    }
+    free(src);
+    if (!out.data) {
+        out.data = (char *)malloc(1);
+        if (!out.data) {
+            if (msg && msg_size) snprintf(msg, msg_size, "JIT: alloc failed");
+            return NULL;
+        }
+        out.data[0] = '\0';
+    }
+    return out.data;
 }
 
 static int jit_compile_job(struct jit_job *job, const char *source, char *msg, size_t msg_size) {
@@ -909,6 +1319,7 @@ static void jit_job_execute(struct jit_job *job) {
     jit_job_cleanup(job);
     if (!job->bg && job->waiter_task_id >= 0) {
         task_wake(job->waiter_task_id);
+        task_sleep_current();
     }
 }
 
@@ -981,6 +1392,20 @@ int os_jit_run(const char *source, int owner_win_id) {
     return job->exit_code;
 }
 
+int os_jit_run_file(const char *path, int owner_win_id) {
+    char msg[128];
+    char *source = NULL;
+    int rc;
+    source = jit_load_source_from_path(path, msg, sizeof(msg));
+    if (!source) {
+        lib_printf("%s\n", msg[0] ? msg : "JIT: failed");
+        return -1;
+    }
+    rc = os_jit_run(source, owner_win_id);
+    free(source);
+    return rc;
+}
+
 int os_jit_run_bg(const char *source, int owner_win_id, char *msg, size_t msg_size) {
     struct jit_job *job = jit_alloc_job(1, owner_win_id);
     if (!job) {
@@ -1000,6 +1425,19 @@ int os_jit_run_bg(const char *source, int owner_win_id, char *msg, size_t msg_si
     task_wake(job->task_id);
     if (msg && msg_size) snprintf(msg, msg_size, "JIT job %d started in background.", job->id);
     return job->id;
+}
+
+int os_jit_run_bg_file(const char *path, int owner_win_id, char *msg, size_t msg_size) {
+    char local_msg[128];
+    char *source = jit_load_source_from_path(path, local_msg, sizeof(local_msg));
+    int rc;
+    if (!source) {
+        if (msg && msg_size) snprintf(msg, msg_size, "%s", local_msg[0] ? local_msg : "JIT: failed");
+        return -1;
+    }
+    rc = os_jit_run_bg(source, owner_win_id, msg, msg_size);
+    free(source);
+    return rc;
 }
 
 void os_jit_ps(char *out, size_t out_size) {

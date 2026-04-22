@@ -27,7 +27,9 @@ struct app_fd_entry {
     uint32_t size;
     uint32_t cap;
     unsigned char *buf;
+    uint32_t cwd_bno;
     char name[20];
+    char cwd[32];
 };
 
 static struct app_fd_entry app_fd_table[APP_MAX_FDS];
@@ -290,6 +292,26 @@ int remove_entry_named(struct Window *w, const char *name) {
         fs_free_chain(old.bno);
     }
     return 0;
+}
+
+int appfs_unlink(const char *path) {
+    uint32_t dir_bno = 0;
+    char cwd_buf[32];
+    char leaf[20];
+    struct Window *ctx = &app_fs_window;
+
+    if (!path || !*path) return -1;
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->cwd_bno = app_fs_cwd_bno ? app_fs_cwd_bno : 1;
+    lib_strcpy(ctx->cwd, app_fs_cwd[0] ? app_fs_cwd : "/root");
+
+    if (resolve_fs_target(ctx, path, &dir_bno, cwd_buf, leaf) != 0) return -1;
+    if (leaf[0] == '\0' || strcmp(leaf, ".") == 0 || strcmp(leaf, "..") == 0) return -1;
+
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->cwd_bno = dir_bno ? dir_bno : 1;
+    lib_strcpy(ctx->cwd, cwd_buf[0] ? cwd_buf : "/root");
+    return remove_entry_named(ctx, leaf);
 }
 
 static int fs_dir_is_ancestor(uint32_t ancestor_bno, uint32_t child_bno) {
@@ -712,8 +734,8 @@ static int appfs_load_file(struct app_fd_entry *fd, const char *name, int flags)
     int idx;
 
     memset(w, 0, sizeof(*w));
-    w->cwd_bno = app_fs_cwd_bno;
-    lib_strcpy(w->cwd, app_fs_cwd);
+    w->cwd_bno = fd && fd->cwd_bno ? fd->cwd_bno : app_fs_cwd_bno;
+    lib_strcpy(w->cwd, (fd && fd->cwd[0]) ? fd->cwd : app_fs_cwd);
     db = load_current_dir(w);
     if (!db) return -1;
 
@@ -743,9 +765,9 @@ static int appfs_load_file(struct app_fd_entry *fd, const char *name, int flags)
 static int appfs_commit(struct app_fd_entry *fd) {
     struct Window *w = &app_fs_window;
     memset(w, 0, sizeof(*w));
-    w->cwd_bno = app_fs_cwd_bno;
-    lib_strcpy(w->cwd, app_fs_cwd);
     if (!fd || !fd->used) return -1;
+    w->cwd_bno = fd->cwd_bno ? fd->cwd_bno : app_fs_cwd_bno;
+    lib_strcpy(w->cwd, fd->cwd[0] ? fd->cwd : app_fs_cwd);
     if (store_file_bytes(w, fd->name, fd->buf ? fd->buf : (const unsigned char *)"", fd->size) != 0) {
         return -1;
     }
@@ -782,10 +804,11 @@ int appfs_close_all(void) {
 
 int appfs_open(const char *path, int flags) {
     char name[20];
+    char cwd_buf[32];
+    uint32_t dir_bno = 0;
     int fd_idx;
     struct app_fd_entry *fd;
 
-    if (!appfs_path_to_name(path, name)) return -1;
     fd_idx = appfs_find_fd();
     if (fd_idx < 0) return -2;
 
@@ -793,6 +816,22 @@ int appfs_open(const char *path, int flags) {
     memset(fd, 0, sizeof(*fd));
     fd->used = 1;
     fd->flags = flags;
+
+    if (path && (strchr(path, '/') || path[0] == '~')) {
+        if (resolve_fs_target(&app_fs_window, path, &dir_bno, cwd_buf, name) != 0 || name[0] == '\0') {
+            memset(fd, 0, sizeof(*fd));
+            return -1;
+        }
+        fd->cwd_bno = dir_bno ? dir_bno : 1;
+        lib_strcpy(fd->cwd, cwd_buf[0] ? cwd_buf : "/root");
+    } else {
+        if (!appfs_path_to_name(path, name)) {
+            memset(fd, 0, sizeof(*fd));
+            return -1;
+        }
+        fd->cwd_bno = app_fs_cwd_bno ? app_fs_cwd_bno : 1;
+        lib_strcpy(fd->cwd, app_fs_cwd[0] ? app_fs_cwd : "/root");
+    }
     copy_name20(fd->name, name);
 
     if ((flags & APP_O_WRITE) && (flags & (APP_O_CREAT | APP_O_TRUNC))) {
@@ -873,6 +912,44 @@ int appfs_write(int fd_no, const void *buf, size_t size) {
     fd->pos += (uint32_t)size;
     if (fd->pos > fd->size) fd->size = fd->pos;
     return (int)size;
+}
+
+int appfs_seek(int fd_no, int offset, int whence) {
+    int fd_idx = fd_no - 3;
+    struct app_fd_entry *fd;
+    int base;
+    int next;
+
+    if (fd_idx < 0 || fd_idx >= APP_MAX_FDS) return -1;
+    fd = &app_fd_table[fd_idx];
+    if (!fd->used) return -1;
+
+    if (whence == 0) base = 0;
+    else if (whence == 1) base = (int)fd->pos;
+    else if (whence == 2) base = (int)fd->size;
+    else return -1;
+
+    next = base + offset;
+    if (next < 0) return -1;
+    if ((uint32_t)next > fd->size) {
+        if (!(fd->flags & APP_O_WRITE)) return -1;
+        if ((uint32_t)next > fd->cap) {
+            if (appfs_reserve(fd, (uint32_t)next) != 0) return -1;
+        }
+        if ((uint32_t)next > fd->size) {
+            memset(fd->buf + fd->size, 0, (uint32_t)next - fd->size);
+            fd->size = (uint32_t)next;
+        }
+    }
+    fd->pos = (uint32_t)next;
+    return next;
+}
+
+int appfs_tell(int fd_no) {
+    int fd_idx = fd_no - 3;
+    if (fd_idx < 0 || fd_idx >= APP_MAX_FDS) return -1;
+    if (!app_fd_table[fd_idx].used) return -1;
+    return (int)app_fd_table[fd_idx].pos;
 }
 
 int appfs_close(int fd_no) {

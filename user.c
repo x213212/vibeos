@@ -320,6 +320,11 @@ void close_window(int idx);
 static void seed_terminal_history(struct Window *w);
 static int path_is_sftp(const char *path);
 static const char *sftp_subpath(const char *path);
+static int copy_between_paths(struct Window *w, const char *src, const char *dst, char *out, int out_max);
+static int local_path_info(struct Window *w, const char *path, int *type_out, uint32_t *bno_out, char *name_out);
+static int local_mkdir_path(struct Window *w, const char *path);
+static int copy_local_dir_recursive(struct Window *w, uint32_t src_bno, const char *dst_path, char *out, int out_max);
+static int copy_sftp_dir_to_local_recursive(struct Window *w, const char *src_remote, const char *dst_path, char *out, int out_max);
 
 static void terminal_unlock_after_cancel(struct Window *w) {
     if (!w || w->kind != WINDOW_KIND_TERMINAL) return;
@@ -331,6 +336,267 @@ static void terminal_unlock_after_cancel(struct Window *w) {
     clear_prompt_input(w);
     terminal_append_prompt(w);
     terminal_scroll_to_bottom(w);
+}
+
+static int copy_between_paths(struct Window *w, const char *src, const char *dst, char *out, int out_max) {
+    int src_sftp, dst_sftp;
+    if (!w || !src || !dst || !out || out_max <= 0) return -1;
+    out[0] = '\0';
+    src_sftp = path_is_sftp(src);
+    dst_sftp = path_is_sftp(dst);
+
+    if (!src_sftp && !dst_sftp) {
+        unsigned char *buf = NULL;
+        uint32_t size = 0;
+        if (load_file_bytes_alloc(w, src, &buf, &size) != 0 || !buf) {
+            lib_strcpy(out, "ERR: Source Read Failed.");
+            return -1;
+        }
+        if (store_file_bytes(w, dst, buf, size) != 0) {
+            free(buf);
+            lib_strcpy(out, "ERR: Destination Write Failed.");
+            return -1;
+        }
+        free(buf);
+        lib_strcpy(out, ">> Copied.");
+        return 0;
+    }
+    if (src_sftp && !dst_sftp) {
+        unsigned char *remote_buf = NULL;
+        uint32_t remote_size = 0;
+        char msg[OUT_BUF_SIZE];
+        if (ssh_client_sftp_read_alloc(sftp_subpath(src), &remote_buf, &remote_size, msg, sizeof(msg)) != 0 || !remote_buf) {
+            lib_strcpy(out, msg[0] ? msg : "ERR: SFTP Read Failed.");
+            return -1;
+        }
+        if (store_file_bytes(w, dst, remote_buf, remote_size) != 0) {
+            free(remote_buf);
+            lib_strcpy(out, "ERR: Destination Write Failed.");
+            return -1;
+        }
+        free(remote_buf);
+        lib_strcpy(out, ">> Copied.");
+        return 0;
+    }
+    if (!src_sftp && dst_sftp) {
+        if (ssh_client_sftp_put(w, src, sftp_subpath(dst), out, out_max) != 0) return -1;
+        return 0;
+    }
+    {
+        unsigned char *remote_buf = NULL;
+        uint32_t remote_size = 0;
+        char msg[OUT_BUF_SIZE];
+        if (ssh_client_sftp_read_alloc(sftp_subpath(src), &remote_buf, &remote_size, msg, sizeof(msg)) != 0 || !remote_buf) {
+            lib_strcpy(out, msg[0] ? msg : "ERR: SFTP Read Failed.");
+            return -1;
+        }
+        if (ssh_client_sftp_write_bytes(sftp_subpath(dst), remote_buf, remote_size, out, out_max) != 0) {
+            free(remote_buf);
+            return -1;
+        }
+        free(remote_buf);
+        return 0;
+    }
+}
+
+static void copy_last_path_segment(char *dst, const char *path, const char *fallback) {
+    const char *base;
+    if (!dst) return;
+    dst[0] = '\0';
+    if (path) {
+        int len = (int)strlen(path);
+        while (len > 0 && path[len - 1] == '/') len--;
+        if (len > 0) {
+            int start = len - 1;
+            while (start > 0 && path[start - 1] != '/') start--;
+            base = path + start;
+            {
+                int n = len - start;
+                if (n > 19) n = 19;
+                memcpy(dst, base, n);
+                dst[n] = '\0';
+                if (dst[0]) return;
+            }
+        }
+    }
+    if (fallback && *fallback) copy_name20(dst, fallback);
+}
+
+static int local_path_info(struct Window *w, const char *path, int *type_out, uint32_t *bno_out, char *name_out) {
+    uint32_t p_bno = 0;
+    char p_cwd[128], leaf[20];
+    struct Window *tmp = &fs_tmp_window;
+    struct dir_block *db;
+    int idx;
+    if (type_out) *type_out = -1;
+    if (bno_out) *bno_out = 0;
+    if (name_out) name_out[0] = '\0';
+    if (!w || !path) return -1;
+    if (resolve_fs_target(w, path, &p_bno, p_cwd, leaf) != 0) return -1;
+    if (leaf[0] == '\0' || strcmp(leaf, ".") == 0) {
+        if (type_out) *type_out = 1;
+        if (bno_out) *bno_out = p_bno ? p_bno : 1;
+        if (name_out) copy_name20(name_out, path_basename(p_cwd));
+        return 0;
+    }
+    memset(tmp, 0, sizeof(*tmp));
+    tmp->cwd_bno = p_bno ? p_bno : 1;
+    db = load_current_dir(tmp);
+    if (!db) return -1;
+    idx = find_entry_index(db, leaf, -1);
+    if (idx < 0) return -1;
+    if (type_out) *type_out = db->entries[idx].type;
+    if (bno_out) *bno_out = db->entries[idx].bno;
+    if (name_out) copy_name20(name_out, db->entries[idx].name);
+    return 0;
+}
+
+static int local_mkdir_path(struct Window *w, const char *path) {
+    char expanded[128];
+    uint32_t p_bno = 0;
+    char p_cwd[128], leaf[20];
+    struct Window *ctx = &fs_tmp_window;
+    struct dir_block *db;
+    int idx;
+    if (!w || !path || !*path) return -1;
+    terminal_expand_home_path(w, path, expanded, sizeof(expanded));
+    if (strcmp(expanded, ".") == 0 || strcmp(expanded, "./") == 0) return 0;
+    if (resolve_editor_target(w, expanded, &p_bno, p_cwd, leaf) != 0 || leaf[0] == '\0') return -1;
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->cwd_bno = p_bno ? p_bno : 1;
+    db = load_current_dir(ctx);
+    if (!db) return -1;
+    if (find_entry_index(db, leaf, -1) != -1) return 0;
+    idx = find_free_entry_index(db);
+    if (idx < 0) return -1;
+    uint32_t nb = balloc();
+    struct blk nb_blk;
+    if (nb == 0) return -1;
+    memset(&db->entries[idx], 0, sizeof(db->entries[idx]));
+    copy_name20(db->entries[idx].name, leaf);
+    db->entries[idx].bno = nb;
+    db->entries[idx].type = 1;
+    db->entries[idx].mode = 7;
+    db->entries[idx].ctime = db->entries[idx].mtime = current_fs_time();
+    virtio_disk_rw(&ctx->local_b, 1);
+    memset(&nb_blk, 0, sizeof(nb_blk));
+    nb_blk.blockno = nb;
+    struct dir_block *nd = (struct dir_block *)nb_blk.data;
+    nd->magic = FS_MAGIC;
+    nd->parent_bno = p_bno ? p_bno : 1;
+    virtio_disk_rw(&nb_blk, 1);
+    return 0;
+}
+
+static int copy_local_dir_recursive(struct Window *w, uint32_t src_bno, const char *dst_path, char *out, int out_max) {
+    struct blk src_blk;
+    struct dir_block *src_db;
+    if (!w || !dst_path) return -1;
+    if (local_mkdir_path(w, dst_path) != 0) {
+        if (out && out_max > 0) lib_strcpy(out, "ERR: mkdir failed.");
+        return -1;
+    }
+    memset(&src_blk, 0, sizeof(src_blk));
+    src_blk.blockno = src_bno;
+    virtio_disk_rw(&src_blk, 0);
+    src_db = (struct dir_block *)src_blk.data;
+    if (src_db->magic != FS_MAGIC) {
+        if (out && out_max > 0) lib_strcpy(out, "ERR: bad source dir.");
+        return -1;
+    }
+    for (int i = 0; i < MAX_DIR_ENTRIES; i++) {
+        char child_src[128];
+        char child_dst[128];
+        unsigned char *buf = NULL;
+        uint32_t size = 0;
+        if (!src_db->entries[i].name[0]) continue;
+        lib_strcpy(child_dst, dst_path);
+        if (child_dst[0] && child_dst[strlen(child_dst) - 1] != '/') lib_strcat(child_dst, "/");
+        lib_strcat(child_dst, src_db->entries[i].name);
+        if (src_db->entries[i].type == 1) {
+            if (copy_local_dir_recursive(w, src_db->entries[i].bno, child_dst, out, out_max) != 0) return -1;
+            continue;
+        }
+        lib_strcpy(child_src, "/root");
+        {
+            char src_path_buf[128];
+            // Resolve a stable absolute source path from src_bno/name by reusing destination dirname semantics is overkill;
+            // use cwd swap on a temporary window rooted at the source dir.
+            struct Window *tmp = &fs_tmp_window;
+            memset(tmp, 0, sizeof(*tmp));
+            tmp->cwd_bno = src_bno;
+            lib_strcpy(tmp->cwd, "/root");
+            if (load_file_bytes_alloc(tmp, src_db->entries[i].name, &buf, &size) != 0 || !buf) {
+                if (out && out_max > 0) lib_strcpy(out, "ERR: file read failed.");
+                return -1;
+            }
+            if (store_file_bytes(w, child_dst, buf, size) != 0) {
+                free(buf);
+                if (out && out_max > 0) lib_strcpy(out, "ERR: file write failed.");
+                return -1;
+            }
+            free(buf);
+            (void)src_path_buf;
+        }
+    }
+    return 0;
+}
+
+static int copy_sftp_dir_to_local_recursive(struct Window *w, const char *src_remote, const char *dst_path, char *out, int out_max) {
+    char list_out[OUT_BUF_SIZE];
+    char line[160];
+    const char *p;
+    if (!w || !src_remote || !dst_path) return -1;
+    if (local_mkdir_path(w, dst_path) != 0) {
+        if (out && out_max > 0) lib_strcpy(out, "ERR: mkdir failed.");
+        return -1;
+    }
+    if (ssh_client_sftp_ls(src_remote, 0, list_out, sizeof(list_out)) != 0) {
+        if (out && out_max > 0) lib_strcpy(out, "ERR: SFTP list failed.");
+        return -1;
+    }
+    p = list_out;
+    while (*p) {
+        int li = 0;
+        char type = 0;
+        char name[96];
+        char src_child[192];
+        char dst_child[128];
+        while (*p == '\n' || *p == '\r') p++;
+        if (!*p) break;
+        while (*p && *p != '\n' && li < (int)sizeof(line) - 1) line[li++] = *p++;
+        if (*p == '\n') p++;
+        line[li] = '\0';
+        if (li < 3 || line[1] != ' ') continue;
+        type = line[0];
+        strncpy(name, line + 2, sizeof(name) - 1);
+        name[sizeof(name) - 1] = '\0';
+        if (!name[0] || strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
+        lib_strcpy(src_child, src_remote);
+        if (src_child[0] && src_child[strlen(src_child) - 1] != '/') lib_strcat(src_child, "/");
+        lib_strcat(src_child, name);
+        lib_strcpy(dst_child, dst_path);
+        if (dst_child[0] && dst_child[strlen(dst_child) - 1] != '/') lib_strcat(dst_child, "/");
+        lib_strcat(dst_child, name);
+        if (type == 'd') {
+            if (copy_sftp_dir_to_local_recursive(w, src_child, dst_child, out, out_max) != 0) return -1;
+        } else if (type == 'f') {
+            unsigned char *remote_buf = NULL;
+            uint32_t remote_size = 0;
+            char msg[OUT_BUF_SIZE];
+            if (ssh_client_sftp_read_alloc(src_child, &remote_buf, &remote_size, msg, sizeof(msg)) != 0 || !remote_buf) {
+                if (out && out_max > 0) lib_strcpy(out, msg[0] ? msg : "ERR: SFTP read failed.");
+                return -1;
+            }
+            if (store_file_bytes(w, dst_child, remote_buf, remote_size) != 0) {
+                free(remote_buf);
+                if (out && out_max > 0) lib_strcpy(out, "ERR: local write failed.");
+                return -1;
+            }
+            free(remote_buf);
+        }
+    }
+    return 0;
 }
 
 void terminal_finish_ctrl_c_cancel(struct Window *w, int killed) {
@@ -3178,7 +3444,9 @@ static int check_dir_and_list(struct Window *w, const char *path, char *out) {
 }
 
 extern int os_jit_run(const char *source, int owner_win_id);
+extern int os_jit_run_file(const char *path, int owner_win_id);
 extern int os_jit_run_bg(const char *source, int owner_win_id, char *msg, size_t msg_size);
+extern int os_jit_run_bg_file(const char *path, int owner_win_id, char *msg, size_t msg_size);
 extern void os_jit_ps(char *out, size_t out_size);
 extern int os_jit_kill(int id, char *msg, size_t msg_size);
 extern int os_jit_cancel_task(int task_id);
@@ -3445,6 +3713,7 @@ void exec_single_cmd(struct Window *w, char *cmd) {
                     memcpy(src, remote_buf, size);
                     src[size] = '\0';
                     free(remote_buf);
+                    appfs_set_cwd(w->cwd_bno, w->cwd);
                     if (bg) os_jit_run_bg(src, w->id, out, OUT_BUF_SIZE);
                     else {
                         rc = os_jit_run(src, w->id);
@@ -3456,10 +3725,22 @@ void exec_single_cmd(struct Window *w, char *cmd) {
                     lib_strcpy(out, msg[0] ? msg : "ERR: Could not read SFTP file.");
                 }
             } else if (load_file_bytes(w, arg, file_io_buf, WGET_MAX_FILE_SIZE, &size) == 0) {
-                file_io_buf[size] = '\0';
-                if (bg) os_jit_run_bg((const char *)file_io_buf, w->id, out, OUT_BUF_SIZE);
-                else {
-                    int rc = os_jit_run((const char *)file_io_buf, w->id);
+                char expanded[128];
+                uint32_t p_bno = 0;
+                char p_cwd[128], leaf[20], abs_path[128];
+                if (resolve_editor_target(w, arg, &p_bno, p_cwd, leaf) == 0 && leaf[0]) {
+                    build_editor_path(abs_path, p_cwd, leaf);
+                } else {
+                    abs_path[0] = '\0';
+                }
+                appfs_set_cwd(w->cwd_bno, w->cwd);
+                if (bg) {
+                    if (abs_path[0]) os_jit_run_bg_file(abs_path, w->id, out, OUT_BUF_SIZE);
+                    else os_jit_run_bg((const char *)file_io_buf, w->id, out, OUT_BUF_SIZE);
+                } else {
+                    int rc;
+                    if (abs_path[0]) rc = os_jit_run_file(abs_path, w->id);
+                    else rc = os_jit_run((const char *)file_io_buf, w->id);
                     if (rc == -2) out[0] = '\0';
                     else lib_strcpy(out, "JIT file execution finished.");
                 }
@@ -4018,6 +4299,94 @@ void exec_single_cmd(struct Window *w, char *cmd) {
         if (strcmp(target, "h") == 0) { lib_strcpy(out, "usage: rm <path>"); return; }
         if (check_dir_and_list(w, target, out)) return;
         if (remove_entry_named(w, target) == 0) lib_strcpy(out, ">> Removed."); else lib_strcpy(out, "ERR: Remove Failed.");
+    } else if (strncmp(cmd, "cp", 2) == 0 && (cmd[2] == '\0' || cmd[2] == ' ')) {
+        char *args = cmd + 2;
+        char *src;
+        char *dst;
+        char *extra;
+        int recursive = 0;
+        while (*args == ' ') args++;
+        if (strncmp(args, "-r", 2) == 0 && (args[2] == '\0' || args[2] == ' ')) {
+            recursive = 1;
+            args += 2;
+            while (*args == ' ') args++;
+        }
+        if (*args == '\0' || strcmp(args, "h") == 0) {
+            lib_strcpy(out, "usage: cp [-r] <src> <dst>");
+            return;
+        }
+        src = args;
+        while (*args && *args != ' ') args++;
+        if (*args == '\0') {
+            lib_strcpy(out, "usage: cp [-r] <src> <dst>");
+            return;
+        }
+        *args++ = '\0';
+        while (*args == ' ') args++;
+        if (*args == '\0') {
+            lib_strcpy(out, "usage: cp [-r] <src> <dst>");
+            return;
+        }
+        dst = args;
+        extra = strchr(dst, ' ');
+        if (extra) {
+            *extra++ = '\0';
+            while (*extra == ' ') extra++;
+            if (*extra != '\0') {
+                lib_strcpy(out, "usage: cp [-r] <src> <dst>");
+                return;
+            }
+        }
+        if (recursive) {
+            int src_type = -1, dst_type = -1;
+            uint32_t src_bno = 0;
+            char src_name[20];
+            char final_dst[128];
+            int dst_is_curdir = (strcmp(dst, ".") == 0 || strcmp(dst, "./") == 0);
+            if (path_is_sftp(src) && !path_is_sftp(dst)) {
+                const char *src_remote = sftp_subpath(src);
+                if (!src_remote || !*src_remote) {
+                    lib_strcpy(out, "ERR: Source dir not found.");
+                    return;
+                }
+                copy_last_path_segment(src_name, src_remote, "copy");
+                if (dst_is_curdir || (local_path_info(w, dst, &dst_type, NULL, NULL) == 0 && dst_type == 1)) {
+                    if (dst_is_curdir) lib_strcpy(final_dst, ".");
+                    else lib_strcpy(final_dst, dst);
+                    if (final_dst[0] && strcmp(final_dst, ".") != 0 && final_dst[strlen(final_dst) - 1] != '/') lib_strcat(final_dst, "/");
+                    else if (strcmp(final_dst, ".") == 0) lib_strcat(final_dst, "/");
+                    lib_strcat(final_dst, src_name[0] ? src_name : "copy");
+                } else {
+                    lib_strcpy(final_dst, dst);
+                }
+                if (copy_sftp_dir_to_local_recursive(w, src_remote, final_dst, out, OUT_BUF_SIZE) == 0) {
+                    lib_strcpy(out, ">> Copied.");
+                }
+            } else {
+                if (path_is_sftp(dst)) {
+                    lib_strcpy(out, "ERR: cp -r local->SFTP not supported yet.");
+                    return;
+                }
+                if (local_path_info(w, src, &src_type, &src_bno, src_name) != 0 || src_type != 1) {
+                    lib_strcpy(out, "ERR: Source dir not found.");
+                    return;
+                }
+                if (dst_is_curdir || (local_path_info(w, dst, &dst_type, NULL, NULL) == 0 && dst_type == 1)) {
+                    if (dst_is_curdir) lib_strcpy(final_dst, ".");
+                    else lib_strcpy(final_dst, dst);
+                    if (final_dst[0] && strcmp(final_dst, ".") != 0 && final_dst[strlen(final_dst) - 1] != '/') lib_strcat(final_dst, "/");
+                    else if (strcmp(final_dst, ".") == 0) lib_strcat(final_dst, "/");
+                    lib_strcat(final_dst, src_name[0] ? src_name : path_basename(src));
+                } else {
+                    lib_strcpy(final_dst, dst);
+                }
+                if (copy_local_dir_recursive(w, src_bno, final_dst, out, OUT_BUF_SIZE) == 0) {
+                    lib_strcpy(out, ">> Copied.");
+                }
+            }
+        } else {
+            copy_between_paths(w, src, dst, out, OUT_BUF_SIZE);
+        }
     } else if ((strncmp(cmd, "mv", 2) == 0 && (cmd[2] == '\0' || cmd[2] == ' ')) ||
                (strncmp(cmd, "rename", 6) == 0 && (cmd[6] == '\0' || cmd[6] == ' '))) {
         char *args = (cmd[0] == 'm' && cmd[1] == 'v') ? cmd + 2 : cmd + 6;
@@ -4056,13 +4425,26 @@ void exec_single_cmd(struct Window *w, char *cmd) {
             }
         }
 
-        rc = move_entry_named(w, src, dst);
-        if (rc == 0) lib_strcpy(out, ">> Moved.");
-        else if (rc == -3) lib_strcpy(out, "ERR: Source Not Found.");
-        else if (rc == -4) lib_strcpy(out, "ERR: Destination Exists.");
-        else if (rc == -5) lib_strcpy(out, "ERR: Dir Full.");
-        else if (rc == -6) lib_strcpy(out, "ERR: Invalid Destination.");
-        else lib_strcpy(out, "ERR: Move Failed.");
+        if (!path_is_sftp(src) && !path_is_sftp(dst)) {
+            rc = move_entry_named(w, src, dst);
+            if (rc == 0) lib_strcpy(out, ">> Moved.");
+            else if (rc == -3) lib_strcpy(out, "ERR: Source Not Found.");
+            else if (rc == -4) lib_strcpy(out, "ERR: Destination Exists.");
+            else if (rc == -5) lib_strcpy(out, "ERR: Dir Full.");
+            else if (rc == -6) lib_strcpy(out, "ERR: Invalid Destination.");
+            else lib_strcpy(out, "ERR: Move Failed.");
+        } else if (path_is_sftp(src) && path_is_sftp(dst)) {
+            if (ssh_client_sftp_rename(sftp_subpath(src), sftp_subpath(dst), out, OUT_BUF_SIZE) != 0) {
+                copy_between_paths(w, src, dst, out, OUT_BUF_SIZE);
+                if (out[0] && strncmp(out, "ERR:", 4) != 0) ssh_client_sftp_unlink(sftp_subpath(src), out, OUT_BUF_SIZE);
+            }
+        } else {
+            if (copy_between_paths(w, src, dst, out, OUT_BUF_SIZE) == 0) {
+                if (path_is_sftp(src)) ssh_client_sftp_unlink(sftp_subpath(src), out, OUT_BUF_SIZE);
+                else if (remove_entry_named(w, src) == 0) lib_strcpy(out, ">> Moved.");
+                else lib_strcpy(out, "ERR: Remove Source Failed.");
+            }
+        }
     } else if (strncmp(cmd, "touch ", 6) == 0) {
         char *fn = cmd + 6; while (*fn == ' ') fn++;
         if (strcmp(fn, "h") == 0) { lib_strcpy(out, "usage: touch <path>"); return; }
