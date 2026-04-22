@@ -1418,6 +1418,157 @@ done:
     return rc;
 }
 
+int ssh_client_sftp_write_bytes(const char *remote_path, const unsigned char *data, uint32_t size, char *out, int out_max)
+{
+    LIBSSH2_SESSION *session = NULL;
+    struct ssh_transport *transport = NULL;
+    LIBSSH2_SFTP *sftp = NULL;
+    LIBSSH2_SFTP_HANDLE *fh = NULL;
+    uint32_t off = 0;
+    char full[192];
+    int rc = -1;
+
+    if (!out || out_max <= 0) return -1;
+    out[0] = '\0';
+    if (!remote_path || !*remote_path) {
+        ssh_set_msg(out, out_max, "ERR: bad remote path.");
+        return -1;
+    }
+    if (!data && size) {
+        ssh_set_msg(out, out_max, "ERR: no data.");
+        return -1;
+    }
+    if (!sftp_mounted) ssh_client_sftp_mount(".", NULL, 0);
+    sftp_join_path(sftp_mount_root, remote_path, full, sizeof(full));
+
+    if (ssh_open_authenticated_session(&session, &transport, out, out_max) != 0) goto done;
+    sftp = ssh_sftp_init_nonblock(session, out, out_max);
+    if (!sftp) goto done;
+
+    for (;;) {
+        fh = libssh2_sftp_open(sftp, full,
+                               LIBSSH2_FXF_WRITE | LIBSSH2_FXF_CREAT | LIBSSH2_FXF_TRUNC,
+                               LIBSSH2_SFTP_S_IRUSR | LIBSSH2_SFTP_S_IWUSR |
+                               LIBSSH2_SFTP_S_IRGRP | LIBSSH2_SFTP_S_IROTH);
+        if (fh) break;
+        if (libssh2_session_last_errno(session) != LIBSSH2_ERROR_EAGAIN) {
+            ssh_set_msg(out, out_max, "ERR: SFTP create failed.");
+            goto done;
+        }
+        ssh_transport_pump();
+    }
+
+    while (off < size) {
+        uint32_t chunk = size - off;
+        ssize_t n;
+        if (chunk > 1024) chunk = 1024;
+        n = libssh2_sftp_write(fh, (const char *)data + off, chunk);
+        if (n == LIBSSH2_ERROR_EAGAIN) {
+            ssh_transport_pump();
+            continue;
+        }
+        if (n <= 0) {
+            ssh_set_msg(out, out_max, "ERR: SFTP write failed.");
+            goto done;
+        }
+        off += (uint32_t)n;
+    }
+
+    snprintf(out, out_max, "OK: sftp write %s (%u bytes)", full, size);
+    rc = 0;
+
+done:
+    if (fh) while (libssh2_sftp_close(fh) == LIBSSH2_ERROR_EAGAIN) ssh_transport_pump();
+    ssh_sftp_shutdown_nonblock(sftp);
+    ssh_close_authenticated_session(session, transport);
+    return rc;
+}
+
+int ssh_client_sftp_unlink(const char *remote_path, char *out, int out_max)
+{
+    LIBSSH2_SESSION *session = NULL;
+    struct ssh_transport *transport = NULL;
+    LIBSSH2_SFTP *sftp = NULL;
+    char full[192];
+    int rc = -1;
+
+    if (!out || out_max <= 0) return -1;
+    out[0] = '\0';
+    if (!remote_path || !*remote_path) {
+        ssh_set_msg(out, out_max, "ERR: bad remote path.");
+        return -1;
+    }
+    if (!sftp_mounted) ssh_client_sftp_mount(".", NULL, 0);
+    sftp_join_path(sftp_mount_root, remote_path, full, sizeof(full));
+
+    if (ssh_open_authenticated_session(&session, &transport, out, out_max) != 0) goto done;
+    sftp = ssh_sftp_init_nonblock(session, out, out_max);
+    if (!sftp) goto done;
+
+    for (;;) {
+        int rr = libssh2_sftp_unlink(sftp, full);
+        if (rr == 0) {
+            snprintf(out, out_max, "OK: sftp rm %s", full);
+            rc = 0;
+            break;
+        }
+        if (rr == LIBSSH2_ERROR_EAGAIN) {
+            ssh_transport_pump();
+            continue;
+        }
+        ssh_set_msg(out, out_max, "ERR: SFTP unlink failed.");
+        break;
+    }
+
+done:
+    ssh_sftp_shutdown_nonblock(sftp);
+    ssh_close_authenticated_session(session, transport);
+    return rc;
+}
+
+int ssh_client_sftp_rename(const char *src_path, const char *dst_path, char *out, int out_max)
+{
+    LIBSSH2_SESSION *session = NULL;
+    struct ssh_transport *transport = NULL;
+    LIBSSH2_SFTP *sftp = NULL;
+    char src_full[192], dst_full[192];
+    int rc = -1;
+
+    if (!out || out_max <= 0) return -1;
+    out[0] = '\0';
+    if (!src_path || !*src_path || !dst_path || !*dst_path) {
+        ssh_set_msg(out, out_max, "ERR: bad remote path.");
+        return -1;
+    }
+    if (!sftp_mounted) ssh_client_sftp_mount(".", NULL, 0);
+    sftp_join_path(sftp_mount_root, src_path, src_full, sizeof(src_full));
+    sftp_join_path(sftp_mount_root, dst_path, dst_full, sizeof(dst_full));
+
+    if (ssh_open_authenticated_session(&session, &transport, out, out_max) != 0) goto done;
+    sftp = ssh_sftp_init_nonblock(session, out, out_max);
+    if (!sftp) goto done;
+
+    for (;;) {
+        int rr = libssh2_sftp_rename(sftp, src_full, dst_full);
+        if (rr == 0) {
+            snprintf(out, out_max, "OK: sftp mv %s -> %s", src_full, dst_full);
+            rc = 0;
+            break;
+        }
+        if (rr == LIBSSH2_ERROR_EAGAIN) {
+            ssh_transport_pump();
+            continue;
+        }
+        ssh_set_msg(out, out_max, "ERR: SFTP rename failed.");
+        break;
+    }
+
+done:
+    ssh_sftp_shutdown_nonblock(sftp);
+    ssh_close_authenticated_session(session, transport);
+    return rc;
+}
+
 int ssh_client_exec_remote(const char *cmd, char *out, int out_max)
 {
     LIBSSH2_SESSION *session = NULL;

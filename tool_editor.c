@@ -3,6 +3,10 @@
 #define TASKBAR_H 30
 #define DESKTOP_H (HEIGHT - TASKBAR_H)
 #define COL_TEXT UI_C_TEXT
+#define COL_SYNTAX_KEYWORD UI_C_TEXT
+#define COL_SYNTAX_COMMENT UI_C_TEXT_DIM
+#define COL_SYNTAX_STRING UI_C_PANEL_HOVER
+#define COL_SYNTAX_PREPROC UI_C_PANEL_ACTIVE
 
 extern void editor_handle_key(struct Window *w, char key);
 extern void editor_load_bytes(struct Window *w, const unsigned char *src, uint32_t size);
@@ -41,6 +45,104 @@ static int editor_line_len(const char *line) {
     int n = 0;
     while (n < EDITOR_LINE_LEN - 1 && line[n]) n++;
     return n;
+}
+
+static int editor_is_ident_char(char ch) {
+    return ((ch >= 'a' && ch <= 'z') ||
+            (ch >= 'A' && ch <= 'Z') ||
+            (ch >= '0' && ch <= '9') ||
+            ch == '_');
+}
+
+static int editor_is_c_keyword_at(const char *line, int pos, int len) {
+    static const char *const keywords[] = {
+        "auto","break","case","char","const","continue","default","do","double",
+        "else","enum","extern","float","for","goto","if","inline","int","long",
+        "register","restrict","return","short","signed","sizeof","static","struct",
+        "switch","typedef","union","unsigned","void","volatile","while",
+        "bool","true","false","class","namespace","public","private","protected",
+        "template","typename","using","virtual","nullptr"
+    };
+    int prev_ok = (pos == 0 || !editor_is_ident_char(line[pos - 1]));
+    if (!prev_ok) return 0;
+    for (unsigned int i = 0; i < sizeof(keywords) / sizeof(keywords[0]); i++) {
+        const char *kw = keywords[i];
+        int klen = 0;
+        while (kw[klen]) klen++;
+        if (pos + klen > len) continue;
+        if (strncmp(line + pos, kw, klen) != 0) continue;
+        if (pos + klen < len && editor_is_ident_char(line[pos + klen])) continue;
+        return klen;
+    }
+    return 0;
+}
+
+static int editor_is_c_like_path(const char *path) {
+    int len = 0;
+    if (!path) return 0;
+    while (path[len]) len++;
+    if (len < 2) return 0;
+    if (len >= 2 && strcmp(path + len - 2, ".c") == 0) return 1;
+    if (len >= 2 && strcmp(path + len - 2, ".h") == 0) return 1;
+    if (len >= 3 && strcmp(path + len - 3, ".cc") == 0) return 1;
+    if (len >= 3 && strcmp(path + len - 3, ".cpp") == 0) return 1;
+    if (len >= 4 && strcmp(path + len - 4, ".hpp") == 0) return 1;
+    return 0;
+}
+
+static void editor_draw_syntax_line(int x, int y, const char *line, int scale) {
+    int len = editor_line_len(line);
+    int char_w = 8 * scale;
+    int i = 0;
+    int first_non_ws = 1;
+    while (i < len) {
+        int seg_len = 1;
+        int color = COL_TEXT;
+        char seg[EDITOR_LINE_LEN];
+
+        if (line[i] != ' ' && line[i] != '\t') first_non_ws = 0;
+
+        if (line[i] == '/' && i + 1 < len && line[i + 1] == '/') {
+            color = COL_SYNTAX_COMMENT;
+            seg_len = len - i;
+        } else if (line[i] == '"' || line[i] == '\'') {
+            char quote = line[i];
+            color = COL_SYNTAX_STRING;
+            seg_len = 1;
+            while (i + seg_len < len) {
+                char ch = line[i + seg_len++];
+                if (ch == '\\' && i + seg_len < len) {
+                    seg_len++;
+                    continue;
+                }
+                if (ch == quote) break;
+            }
+        } else if (first_non_ws && line[i] == '#') {
+            color = COL_SYNTAX_PREPROC;
+            seg_len = len - i;
+        } else {
+            int kw_len = editor_is_c_keyword_at(line, i, len);
+            if (kw_len > 0) {
+                color = COL_SYNTAX_KEYWORD;
+                seg_len = kw_len;
+            } else {
+                seg_len = 1;
+                while (i + seg_len < len) {
+                    char ch = line[i + seg_len];
+                    if ((ch == '/' && i + seg_len + 1 < len && line[i + seg_len + 1] == '/') ||
+                        ch == '"' || ch == '\'' || ch == '#') break;
+                    if (editor_is_c_keyword_at(line, i + seg_len, len) > 0) break;
+                    seg_len++;
+                }
+            }
+        }
+
+        if (seg_len >= EDITOR_LINE_LEN) seg_len = EDITOR_LINE_LEN - 1;
+        memcpy(seg, line + i, seg_len);
+        seg[seg_len] = '\0';
+        draw_text_scaled(x + i * char_w, y, seg, color, scale);
+        i += seg_len;
+    }
 }
 
 static void editor_clamp_cursor(struct Window *w) {
@@ -625,6 +727,7 @@ void editor_render(struct Window *w, int x, int y, int ww, int wh) {
     } else {
         lib_strcpy(display_path, "untitled.txt");
     }
+    int syntax_c_like = editor_is_c_like_path(display_path);
     
     editor_scroll_to_cursor(w);
     
@@ -644,9 +747,9 @@ void editor_render(struct Window *w, int x, int y, int ww, int wh) {
         draw_text_scaled(x + 10 + num_offset, text_y + i * line_h, num_str, UI_C_TEXT_DIM, scale);
 
         // 2. 繪製內容
-        char clip[EDITOR_LINE_LEN];
         int len = editor_line_len(w->editor_lines[row]);
-        draw_text_scaled(text_x, text_y + i * line_h, w->editor_lines[row], COL_TEXT, scale);
+        if (syntax_c_like) editor_draw_syntax_line(text_x, text_y + i * line_h, w->editor_lines[row], scale);
+        else draw_text_scaled(text_x, text_y + i * line_h, w->editor_lines[row], COL_TEXT, scale);
 
         // 搜尋高亮
         if (w->editor_cmd_len > 0 && w->editor_mode != 3) {
@@ -661,9 +764,9 @@ void editor_render(struct Window *w, int x, int y, int ww, int wh) {
             }
         }
 
-        // 3. 繪製游標 (加入閃爍邏輯)
+        // 3. 繪製游標
         if (row == w->editor_cursor_row && active_win_idx == w->id) {
-            if (((sys_now() / 200U) & 1U) == 0U) { // 每 200ms 閃爍一次
+            if (((sys_now() / 500U) & 1U) == 0U) {
                 int cx = text_x + w->editor_cursor_col * char_w;
                 int cy = text_y + i * line_h;
                 // 確保游標不超出視窗右邊界

@@ -5461,7 +5461,7 @@ void gui_task(void) {
     lib_printf("[BOOT] gui_task start active_win_idx=%d\n", active_win_idx);
     int last_mx = gui_mx, last_my = gui_my;
     int last_cursor_mode = -1;
-    int last_term_cursor_blink = -1;
+    int last_text_cursor_blink = -1;
     while (1) {
         int redraw_needed = 0;
         int has_demo3d = 0;
@@ -5811,16 +5811,16 @@ void gui_task(void) {
             last_cursor_mode = gui_cursor_mode;
         }
         if (active_window_valid() &&
-            wins[active_win_idx].kind == WINDOW_KIND_TERMINAL &&
-            wins[active_win_idx].total_rows > 0) {
+            ((wins[active_win_idx].kind == WINDOW_KIND_TERMINAL && wins[active_win_idx].total_rows > 0) ||
+             wins[active_win_idx].kind == WINDOW_KIND_EDITOR)) {
             int blink = (int)(((((uint32_t)sys_now()) / 500U) & 1U) == 0U);
-            if (blink != last_term_cursor_blink) {
+            if (blink != last_text_cursor_blink) {
                 redraw_needed = 1;
-                last_term_cursor_blink = blink;
+                last_text_cursor_blink = blink;
             }
-        } else if (last_term_cursor_blink != -1) {
+        } else if (last_text_cursor_blink != -1) {
             redraw_needed = 1;
-            last_term_cursor_blink = -1;
+            last_text_cursor_blink = -1;
         }
         if (redraw_needed || (gui_redraw_needed && any_window_active())) {
             static int boot_redraw_logged = 0;
