@@ -42,6 +42,9 @@
 #include "tcc.h"
 #include <assert.h>
 
+extern int jit_debug_codegen_watch_enabled;
+extern void jit_watch_access(uint32_t addr, uint32_t size, int is_store);
+
 #ifdef TCC_RISCV_ilp32
 ST_DATA const char *const target_machine_defs = "__riscv\0"
                                                 "__riscv_xlen 32\0"
@@ -242,6 +245,43 @@ static void load_large_constant( int rr, int fc, uint32_t pi )
     emit_SLLI( rr, rr, 8 );
 }
 
+static void emit_jit_watch_access( int base_reg, int offset, int size, int is_store )
+{
+    const int sp = 2;
+    const int ra = 1;
+    const int t0 = 5;
+    const int t1 = 6;
+    const int a0 = 10;
+    const int a1 = 11;
+    const int a2 = 12;
+
+    if( !jit_debug_codegen_watch_enabled )
+        return;
+
+    emit_ADDI( sp, sp, -48 );
+    emit_SW( sp, ra, 0 );
+    emit_SW( sp, t0, 4 );
+    emit_SW( sp, t1, 8 );
+    for( int i = 0; i < 8; i++ )
+        emit_SW( sp, 10 + i, 12 + i * 4 );
+
+    if( offset )
+        emit_ADDI( a0, base_reg, offset );
+    else
+        emit_MV( a0, base_reg );
+    emit_ADDI( a1, 0, size );
+    emit_ADDI( a2, 0, is_store ? 1 : 0 );
+    emit_LI( t0, (uint32_t)(uintptr_t)jit_watch_access );
+    emit_JALR( ra, t0, 0 );
+
+    for( int i = 0; i < 8; i++ )
+        emit_LW( 10 + i, sp, 12 + i * 4 );
+    emit_LW( t1, sp, 8 );
+    emit_LW( t0, sp, 4 );
+    emit_LW( ra, sp, 0 );
+    emit_ADDI( sp, sp, 48 );
+}
+
 /*
  * Similar to load this takes a stack value (sv) and stores it into a register (r)
  * However, we know that the thing on the stack is an lvalue (it has a name) and therefore
@@ -310,6 +350,7 @@ static void load_lvalue( int r, SValue *sv )
         tcc_error( "unimp: load(non-local lval)" );
     }
     // TODO handle floating pont, 64-bit values, and 128-bit values
+    emit_jit_watch_access( rs1, lvar_offset, size, 0 );
     switch( size ) {
         case 1: emit_LB( dest_reg, rs1, lvar_offset ); break;
         case 2: emit_LH( dest_reg, rs1, lvar_offset ); break;
@@ -515,6 +556,7 @@ ST_FUNC void store( int r, SValue *sv )
         case 4: emit_SW( loc_reg, src_reg, offset ); break;
         default: tcc_error( "unexpected store size: %d", size );
     }
+    emit_jit_watch_access( loc_reg, offset, size, 1 );
 }
 
 static void gcall_or_jmp( int docall )
