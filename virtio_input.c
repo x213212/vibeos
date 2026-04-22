@@ -2,6 +2,8 @@
 #include "os.h"
 #include "vga.h"
 
+#define CTRLDBG_PRINTF(...) do { } while (0)
+
 #define INPUT_QUEUE_SIZE 64
 #define INPUT_EVENT_QUEUE_SIZE 512
 
@@ -31,6 +33,7 @@ struct raw_input_event {
 
 static volatile uint16 input_evt_head = 0;
 static volatile uint16 input_evt_tail = 0;
+static volatile int input_poll_busy = 0;
 static struct raw_input_event input_events[INPUT_EVENT_QUEUE_SIZE];
 
 static void enqueue_input_event(uint16 device, uint16 type, uint16 code, uint32 value) {
@@ -127,7 +130,9 @@ void virtio_mouse_isr() {
 }
 
 void virtio_input_poll(void) {
-    static int caps_lock = 0, shift_pressed = 0, ctrl_l_pressed = 0;
+    static int caps_lock = 0, shift_pressed = 0, ctrl_l_pressed = 0, ctrl_r_pressed = 0;
+    if (input_poll_busy) return;
+    input_poll_busy = 1;
     // 使用舊版穩定的 kmap 和 smap
     static char kmap[128] = {
         [1]=27, [2]='1', [3]='2', [4]='3', [5]='4', [6]='5', [7]='6', [8]='7', [9]='8', [10]='9', [11]='0', [0x0C]='-', [0x0D]='=', [0x0E]=8, [0x0F]='\t',
@@ -150,15 +155,33 @@ void virtio_input_poll(void) {
 
             // 1. 處理狀態鍵 (Shift, Ctrl) - 這部分必須先做
             if (ev.code == 0x2A || ev.code == 0x36) { shift_pressed = (ev.value == 1); }
-            else if (ev.code == 29) { ctrl_l_pressed = (ev.value == 1); gui_ctrl_pressed = ctrl_l_pressed; }
+            else if (ev.code == 29) {
+                ctrl_l_pressed = (ev.value == 1);
+                gui_ctrl_pressed = (ctrl_l_pressed || ctrl_r_pressed);
+                CTRLDBG_PRINTF("[CTRLDBG] input lctrl value=%u pressed=%d any=%d\n",
+                               ev.value, ctrl_l_pressed, gui_ctrl_pressed);
+            }
+            else if (ev.code == 97) {
+                ctrl_r_pressed = (ev.value == 1);
+                gui_ctrl_pressed = (ctrl_l_pressed || ctrl_r_pressed);
+                CTRLDBG_PRINTF("[CTRLDBG] input rctrl value=%u pressed=%d any=%d\n",
+                               ev.value, ctrl_r_pressed, gui_ctrl_pressed);
+            }
             
             // 2. 處理按下 (Key Down)
             if (ev.value == 1) {
+                if (ev.code == 46) {
+                    CTRLDBG_PRINTF("[CTRLDBG] input raw-c ctrl_l=%d ctrl_r=%d any=%d\n",
+                                   ctrl_l_pressed, ctrl_r_pressed, (ctrl_l_pressed || ctrl_r_pressed));
+                }
                 // 特殊快捷鍵
-                if (shift_pressed && ev.code == 15) gui_shortcut_switch_task = 1;
-                else if (ctrl_l_pressed && ev.code == 20) gui_shortcut_new_task = 1;
-                else if (ctrl_l_pressed && ev.code == 16) gui_shortcut_close_task = 1;
-                else if (ctrl_l_pressed && ev.code == 46) gui_key = 3;
+                if ((ctrl_l_pressed || ctrl_r_pressed) && ev.code == 15) gui_shortcut_switch_task = 1;
+                else if ((ctrl_l_pressed || ctrl_r_pressed) && ev.code == 20) gui_shortcut_new_task = 1;
+                else if ((ctrl_l_pressed || ctrl_r_pressed) && ev.code == 16) gui_shortcut_close_task = 1;
+                else if ((ctrl_l_pressed || ctrl_r_pressed) && ev.code == 46) {
+                    gui_key = 3;
+                    CTRLDBG_PRINTF("[CTRLDBG] input ctrl-c gui_key=%d\n", gui_key);
+                }
                 else if (ev.code == 0x3A) caps_lock = !caps_lock;
                 // 方向鍵與特殊鍵 (恢復 Vim 支援)
                 else if (ev.code == 103) gui_key = 0x10; // Up
@@ -214,4 +237,5 @@ void virtio_input_poll(void) {
             }
         }
     }
+    input_poll_busy = 0;
 }

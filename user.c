@@ -3,6 +3,9 @@
 #include "lwip/ip_addr.h"
 #include "lwip/ip4_addr.h"
 
+#define CTRLDBG_PRINTF(...) do { } while (0)
+#define INPUTDBG_PRINTF(...) do { } while (0)
+
 extern volatile int need_resched;
 extern int gui_mx, gui_my, gui_clicked, gui_click_pending, gui_right_clicked, gui_right_click_pending, gui_wheel, gui_shortcut_new_task, gui_shortcut_close_task, gui_shortcut_switch_task, gui_ctrl_pressed;
 extern char gui_key;
@@ -317,6 +320,29 @@ void close_window(int idx);
 static void seed_terminal_history(struct Window *w);
 static int path_is_sftp(const char *path);
 static const char *sftp_subpath(const char *path);
+
+static void terminal_unlock_after_cancel(struct Window *w) {
+    if (!w || w->kind != WINDOW_KIND_TERMINAL) return;
+    w->executing_cmd = 0;
+    w->waiting_wget = 0;
+    w->cancel_requested = 0;
+    w->submit_locked = 0;
+    clear_window_input_queue(w);
+    clear_prompt_input(w);
+    terminal_append_prompt(w);
+    terminal_scroll_to_bottom(w);
+}
+
+void terminal_finish_ctrl_c_cancel(struct Window *w, int killed) {
+    char line[64];
+    if (!w || w->kind != WINDOW_KIND_TERMINAL) return;
+    if (killed > 0) {
+        snprintf(line, sizeof(line), "JIT: killed %d job(s).", killed);
+        append_terminal_line(w, line);
+    }
+    terminal_unlock_after_cancel(w);
+}
+
 static void release_app_owner_command_state(void) {
     if (app_owner_win_id < 0 || app_owner_win_id >= MAX_WINDOWS) {
         app_owner_win_id = -1;
@@ -324,15 +350,7 @@ static void release_app_owner_command_state(void) {
     }
     struct Window *w = &wins[app_owner_win_id];
     if (w->active && w->kind == WINDOW_KIND_TERMINAL) {
-        w->executing_cmd = 0;
-        w->cancel_requested = 0;
-        w->submit_locked = 0;
-        w->waiting_wget = 0;
-        clear_window_input_queue(w);
-        clear_prompt_input(w);
-        if (w->total_rows > 0) {
-            redraw_prompt_line(w, w->total_rows - 1);
-        }
+        terminal_unlock_after_cancel(w);
     }
     app_owner_win_id = -1;
 }
@@ -386,7 +404,19 @@ void app_exit_trampoline(void) {
 static int z_order[MAX_WINDOWS];
 int active_win_idx = -1;
 static uint8_t sheet_map[WIDTH * HEIGHT] __attribute__((aligned(16)));
-static char terminal_clipboard[2048];
+char terminal_clipboard[2048];
+
+void clipboard_set(const char *text) {
+    if (!text) return;
+    int len = (int)strlen(text);
+    if (len >= (int)sizeof(terminal_clipboard)) len = (int)sizeof(terminal_clipboard) - 1;
+    memcpy(terminal_clipboard, text, len);
+    terminal_clipboard[len] = '\0';
+}
+
+const char *clipboard_get(void) {
+    return terminal_clipboard;
+}
 static int terminal_worker_task_ids[TERMINAL_WORKERS];
 static int network_task_id = -1;
 
@@ -1285,7 +1315,7 @@ static int window_input_pop(struct Window *w, char *key) {
     return 1;
 }
 
-static void wake_terminal_worker_for_window(int win_idx) {
+void wake_terminal_worker_for_window(int win_idx) {
     if (win_idx < 0) return;
     int worker = win_idx % TERMINAL_WORKERS;
     if (worker >= 0 && worker < TERMINAL_WORKERS && terminal_worker_task_ids[worker] >= 0) {
@@ -1302,14 +1332,18 @@ void network_task_notify(void) {
 }
 
 static void broadcast_ctrl_c(void) {
-    for (int i = 0; i < MAX_WINDOWS; i++) {
-        if (!wins[i].active || wins[i].kind != WINDOW_KIND_TERMINAL) continue;
-        if (wins[i].executing_cmd || wins[i].waiting_wget) {
-            wins[i].cancel_requested = 1;
-            int worker = i % TERMINAL_WORKERS;
-            if (worker >= 0 && worker < TERMINAL_WORKERS && terminal_worker_task_ids[worker] >= 0) {
-                os_jit_cancel_task(terminal_worker_task_ids[worker]);
-            }
+    if (active_win_idx < 0 || active_win_idx >= MAX_WINDOWS) return;
+    struct Window *w = &wins[active_win_idx];
+    if (!w->active || w->kind != WINDOW_KIND_TERMINAL) return;
+    if (w->submit_locked || w->executing_cmd || w->waiting_wget || os_jit_owner_active(w->id)) {
+        CTRLDBG_PRINTF("[CTRLDBG] broadcast win=%d exec=%d wget=%d jit=%d\n",
+                       w->id, w->executing_cmd, w->waiting_wget,
+                       os_jit_owner_active(w->id));
+        w->cancel_requested = 1;
+        int killed = os_jit_cancel_by_owner(w->id);
+        CTRLDBG_PRINTF("[CTRLDBG] broadcast win=%d killed=%d\n", w->id, killed);
+        if (killed > 0) {
+            terminal_finish_ctrl_c_cancel(w, killed);
         }
     }
 }
@@ -1408,7 +1442,7 @@ void terminal_app_stdout_puts(int win_id, const char *s) {
 
 static int terminal_visible_rows(struct Window *w) {
     int wh = w->maximized ? DESKTOP_H : w->h;
-    int rv = (wh - 40) / terminal_line_h(w);
+    int rv = (wh - 50) / terminal_line_h(w);
     if (rv < 1) rv = 1;
     return rv;
 }
@@ -1576,6 +1610,13 @@ static void terminal_selection_normalized(struct Window *w, int *sr, int *sc, in
     }
 }
 
+static int terminal_has_nonempty_selection(struct Window *w) {
+    int sr, sc, er, ec;
+    if (!w || !w->has_selection) return 0;
+    terminal_selection_normalized(w, &sr, &sc, &er, &ec);
+    return (sr != er) || (sc != ec);
+}
+
 static int terminal_mouse_to_cell(struct Window *w, int mx, int my, int *row, int *col) {
     if (!w || w->kind != WINDOW_KIND_TERMINAL) return 0;
     int x = w->maximized ? 0 : w->x;
@@ -1584,7 +1625,7 @@ static int terminal_mouse_to_cell(struct Window *w, int mx, int my, int *row, in
     int wh = w->maximized ? DESKTOP_H : w->h;
     int left = x + 10;
     int top = y + 40;
-    int inner_h = wh - 40;
+    int inner_h = wh - 50;
     if (mx < left || mx >= x + ww - 15 || my < top || my >= top + inner_h) return 0;
     int r = (my - top) / terminal_line_h(w);
     int c = (mx - left) / terminal_char_w(w);
@@ -1602,6 +1643,7 @@ static int terminal_mouse_to_cell(struct Window *w, int mx, int my, int *row, in
 
 static void terminal_copy_selection(struct Window *w) {
     if (!w || !w->has_selection) return;
+    if (!terminal_has_nonempty_selection(w)) return;
     int sr, sc, er, ec;
     int pos = 0;
     terminal_selection_normalized(w, &sr, &sc, &er, &ec);
@@ -1623,7 +1665,8 @@ static void terminal_copy_selection(struct Window *w) {
 }
 
 static void terminal_paste_clipboard(struct Window *w) {
-    if (!w || w->kind != WINDOW_KIND_TERMINAL || !terminal_clipboard[0]) return;
+    if (!w || !terminal_clipboard[0]) return;
+    if (w->kind != WINDOW_KIND_TERMINAL && w->kind != WINDOW_KIND_EDITOR) return;
     for (int i = 0; terminal_clipboard[i]; i++) {
         char ch = terminal_clipboard[i];
         if (ch == '\n') ch = 10;
@@ -2015,8 +2058,16 @@ static int tab_complete_sftp_name(struct Window *w, int row, int token_start, in
     }
 
     lib_strcpy(remote_dir, sftp_subpath(dir_part));
-    if (ssh_client_sftp_ls(remote_dir, list_out, sizeof(list_out)) != 0) return 0;
-    if (strcmp(list_out, "(empty)") == 0) return 0;
+    if (ssh_client_sftp_ls(remote_dir, 0, list_out, sizeof(list_out)) != 0) {
+        set_shell_status(w, list_out[0] ? list_out : "SFTP completion failed.");
+        redraw_prompt_line(w, row);
+        return 1;
+    }
+    if (strcmp(list_out, "(empty)") == 0) {
+        set_shell_status(w, "SFTP: empty");
+        redraw_prompt_line(w, row);
+        return 1;
+    }
 
     if (leaf_prefix[0] == '\0') {
         char shown[OUT_BUF_SIZE];
@@ -2270,6 +2321,7 @@ static void try_tab_complete(struct Window *w, int row) {
     if (!terminal_first_token(expanded_line, resolved_cmd, sizeof(resolved_cmd))) {
         resolved_cmd[0] = '\0';
     }
+    set_shell_status(w, "");
 
     // If there's a space before and no prefix, or prefix has path chars, use path completion
     if (token_start > 0) {
@@ -2287,8 +2339,11 @@ static void try_tab_complete(struct Window *w, int row) {
     int first_end = 0;
     while (first_end < w->edit_len && w->cmd_buf[first_end] != ' ') first_end++;
     if (token_start < first_end || token_start == 0) {
-        tab_complete_command(w, row, token_start, token_end);
+        if (tab_complete_command(w, row, token_start, token_end)) return;
     }
+
+    set_shell_status(w, "No completion");
+    redraw_prompt_line(w, row);
 }
 
 int find_entry_index(struct dir_block *db, const char *name, int type_filter) {
@@ -2445,6 +2500,7 @@ void close_window(int idx) {
     if (active_win_idx == -1) {
         cycle_active_window();
     }
+    request_gui_redraw();
 }
 
 static int active_window_valid(void) {
@@ -2950,6 +3006,7 @@ void bring_to_front(int idx) {
         z_order[MAX_WINDOWS-1] = idx;
         active_win_idx = idx;
         wins[idx].taskbar_anim = 8;
+        request_gui_redraw();
     }
 }
 
@@ -3120,11 +3177,12 @@ static int check_dir_and_list(struct Window *w, const char *path, char *out) {
     return 0;
 }
 
-extern void os_jit_run(const char *source);
+extern int os_jit_run(const char *source, int owner_win_id);
 extern int os_jit_run_bg(const char *source, int owner_win_id, char *msg, size_t msg_size);
 extern void os_jit_ps(char *out, size_t out_size);
 extern int os_jit_kill(int id, char *msg, size_t msg_size);
 extern int os_jit_cancel_task(int task_id);
+extern int os_jit_owner_active(int owner_win_id);
 extern void os_jit_shared_reset(void);
 extern void os_jit_init(void);
 
@@ -3132,6 +3190,8 @@ static int path_is_sftp(const char *path) {
     return path &&
            ((strncmp(path, "/sftp", 5) == 0 && (path[5] == '\0' || path[5] == '/')) ||
             (strncmp(path, "/sftpd", 6) == 0 && (path[6] == '\0' || path[6] == '/')) ||
+            (strncmp(path, "./sftp", 6) == 0 && (path[6] == '\0' || path[6] == '/')) ||
+            (strncmp(path, "./sftpd", 7) == 0 && (path[7] == '\0' || path[7] == '/')) ||
             (strncmp(path, "sftp", 4) == 0 && (path[4] == '\0' || path[4] == '/')) ||
             (strncmp(path, "sftpd", 5) == 0 && (path[5] == '\0' || path[5] == '/')));
 }
@@ -3140,6 +3200,8 @@ static const char *sftp_subpath(const char *path) {
     if (!path_is_sftp(path)) return path;
     if (strncmp(path, "/sftpd", 6) == 0) path += 6;
     else if (strncmp(path, "/sftp", 5) == 0) path += 5;
+    else if (strncmp(path, "./sftpd", 7) == 0) path += 7;
+    else if (strncmp(path, "./sftp", 6) == 0) path += 6;
     else if (strncmp(path, "sftpd", 5) == 0) path += 5;
     else path += 4;
     if (*path == '/') path++;
@@ -3363,8 +3425,9 @@ void exec_single_cmd(struct Window *w, char *cmd) {
             if (bg) {
                 os_jit_run_bg(source, w->id, out, OUT_BUF_SIZE);
             } else {
-                os_jit_run(source);
-                lib_strcpy(out, "JIT execution finished.");
+                int rc = os_jit_run(source, w->id);
+                if (rc == -2) out[0] = '\0';
+                else lib_strcpy(out, "JIT execution finished.");
             }
         } else {
             uint32_t size = 0;
@@ -3373,6 +3436,7 @@ void exec_single_cmd(struct Window *w, char *cmd) {
                 char msg[OUT_BUF_SIZE];
                 if (ssh_client_sftp_read_alloc(sftp_subpath(arg), &remote_buf, &size, msg, sizeof(msg)) == 0 && remote_buf) {
                     char *src = (char *)malloc(size + 1);
+                    int rc = 0;
                     if (!src) {
                         free(remote_buf);
                         lib_strcpy(out, "ERR: No Memory.");
@@ -3382,9 +3446,12 @@ void exec_single_cmd(struct Window *w, char *cmd) {
                     src[size] = '\0';
                     free(remote_buf);
                     if (bg) os_jit_run_bg(src, w->id, out, OUT_BUF_SIZE);
-                    else os_jit_run(src);
+                    else {
+                        rc = os_jit_run(src, w->id);
+                        if (rc == -2) out[0] = '\0';
+                    }
                     free(src);
-                    if (!bg) lib_strcpy(out, "JIT SFTP file execution finished.");
+                    if (!bg && rc != -2 && out[0] == '\0') lib_strcpy(out, "JIT SFTP file execution finished.");
                 } else {
                     lib_strcpy(out, msg[0] ? msg : "ERR: Could not read SFTP file.");
                 }
@@ -3392,8 +3459,9 @@ void exec_single_cmd(struct Window *w, char *cmd) {
                 file_io_buf[size] = '\0';
                 if (bg) os_jit_run_bg((const char *)file_io_buf, w->id, out, OUT_BUF_SIZE);
                 else {
-                    os_jit_run((const char *)file_io_buf);
-                    lib_strcpy(out, "JIT file execution finished.");
+                    int rc = os_jit_run((const char *)file_io_buf, w->id);
+                    if (rc == -2) out[0] = '\0';
+                    else lib_strcpy(out, "JIT file execution finished.");
                 }
             } else {
                 lib_strcpy(out, "ERR: Could not read file.");
@@ -3664,7 +3732,7 @@ void exec_single_cmd(struct Window *w, char *cmd) {
         single_out[0] = '\0';
         if (*path_arg != '\0' && strcmp(path_arg, "-all") != 0) {
             if (path_is_sftp(path_arg)) {
-                ssh_client_sftp_ls(sftp_subpath(path_arg), out, OUT_BUF_SIZE);
+                ssh_client_sftp_ls(sftp_subpath(path_arg), all, out, OUT_BUF_SIZE);
                 return;
             }
             uint32_t p_bno = 0; char p_cwd[128], leaf[20];
@@ -3697,7 +3765,9 @@ void exec_single_cmd(struct Window *w, char *cmd) {
         memset(ctx, 0, sizeof(*ctx)); ctx->cwd_bno = target_bno;
         struct dir_block *db = load_current_dir(ctx);
         if(!db) { lib_strcpy(out, "ERR: Run 'format'."); return; }
-        int printed = 0; out[0] = '\0';
+        int printed = 0;
+        int stream_lines = 0;
+        out[0] = '\0';
         for(int i=0; i<MAX_DIR_ENTRIES; i++) if(db->entries[i].name[0]) {
             if(!all && db->entries[i].name[0] == '.' && strcmp(db->entries[i].name, ".bashrc") != 0) continue;
             char row[OUT_BUF_SIZE]; row[0] = '\0';
@@ -3714,12 +3784,27 @@ void exec_single_cmd(struct Window *w, char *cmd) {
                 append_out_str(row, OUT_BUF_SIZE, (db->entries[i].type==1) ? "d " : "f ");
                 append_out_str(row, OUT_BUF_SIZE, db->entries[i].name);
             }
-            append_out_str(out, OUT_BUF_SIZE, row);
-            append_out_str(out, OUT_BUF_SIZE, "\n");
+            append_out_str(row, OUT_BUF_SIZE, "\n");
+            append_terminal_line(w, row);
+            stream_lines++;
+            if ((stream_lines & 7) == 0) task_os();
             printed = 1;
         }
-        append_virtual_mount_entries(show_virtual_mounts || target_bno == 1, all, out, &printed);
-        if (!printed) lib_strcpy(out, "(empty)");
+        if (show_virtual_mounts || target_bno == 1) {
+            char mount_row[OUT_BUF_SIZE];
+            int mount_printed = 0;
+            mount_row[0] = '\0';
+            append_virtual_mount_entries(1, all, mount_row, &mount_printed);
+            if (mount_printed) {
+                append_terminal_line(w, mount_row);
+                printed = 1;
+            }
+        }
+        if (!printed) {
+            append_terminal_line(w, "(empty)");
+        }
+        out[0] = '\0';
+        return;
     } else if (strncmp(cmd, "sftp", 4) == 0 && (cmd[4] == '\0' || cmd[4] == ' ')) {
         char *arg = cmd + 4;
         while (*arg == ' ') arg++;
@@ -3735,8 +3820,14 @@ void exec_single_cmd(struct Window *w, char *cmd) {
             ssh_client_sftp_mount(*root ? root : ".", out, OUT_BUF_SIZE);
         } else if (strncmp(arg, "ls", 2) == 0 && (arg[2] == '\0' || arg[2] == ' ')) {
             char *path = arg + 2;
+            int all = 0;
             while (*path == ' ') path++;
-            ssh_client_sftp_ls(path, out, OUT_BUF_SIZE);
+            if (strncmp(path, "-all", 4) == 0 && (path[4] == '\0' || path[4] == ' ')) {
+                all = 1;
+                path += 4;
+                while (*path == ' ') path++;
+            }
+            ssh_client_sftp_ls(path, all, out, OUT_BUF_SIZE);
         } else if (strncmp(arg, "get ", 4) == 0) {
             char *remote = arg + 4;
             char *local;
@@ -4184,11 +4275,9 @@ void exec_single_cmd(struct Window *w, char *cmd) {
         char *fn = cmd + 3;
         while (*fn == ' ') fn++;
         if (*fn == '\0') {
-            lib_printf("[vim] missing file cmd='%s'\n", cmd);
             lib_strcpy(out, "ERR: Missing File.");
             return;
         }
-        lib_printf("[vim] run_command cmd='%s' fn='%s'\n", cmd, fn);
         int rc = open_text_editor(w, fn);
         if (rc == 0) lib_strcpy(out, ">> Vim Opened.");
         else if (rc == -4) lib_strcpy(out, "ERR: File Too Big.");
@@ -4269,7 +4358,6 @@ void run_command(struct Window *w) {
     }
 
     w->executing_cmd = 1;
-    w->cancel_requested = 0;
 
     if (terminal_is_ssh_auth_request(full_cmd)) {
         w->executing_cmd = 0;
@@ -4296,6 +4384,12 @@ void run_command(struct Window *w) {
         w->total_rows = 1; w->v_offset = 0; 
         lib_strcpy(w->lines[0], PROMPT); w->cur_col = PROMPT_LEN;
         w->executing_cmd = 0; w->submit_locked = 0;
+        return;
+    }
+
+    if (w->cancel_requested) {
+        append_terminal_line(w, "Command cancelled.");
+        terminal_unlock_after_cancel(w);
         return;
     }
 
@@ -4331,6 +4425,7 @@ void run_command(struct Window *w) {
     if (!app_running) { 
         w->executing_cmd = 0; 
         w->submit_locked = 0; 
+        w->cancel_requested = 0;
     }
 }
 
@@ -4387,8 +4482,18 @@ static void handle_window_mailbox(struct Window *w) {
         return;
     }
     if (key == 3) {
-        if (w->executing_cmd || w->waiting_wget) {
+        CTRLDBG_PRINTF("[CTRLDBG] mailbox win=%d exec=%d wget=%d jit=%d\n",
+                       w->id, w->executing_cmd, w->waiting_wget, os_jit_owner_active(w->id));
+        if (w->submit_locked || w->executing_cmd || w->waiting_wget || os_jit_owner_active(w->id)) {
+            char line[64];
             w->cancel_requested = 1;
+            int killed = os_jit_cancel_by_owner(w->id);
+            CTRLDBG_PRINTF("[CTRLDBG] mailbox win=%d killed=%d\n", w->id, killed);
+            if (killed > 0) {
+                snprintf(line, sizeof(line), "JIT: killed %d job(s).", killed);
+                append_terminal_line(w, line);
+                terminal_unlock_after_cancel(w);
+            }
         } else {
             w->submit_locked = 0;
             w->cancel_requested = 0;
@@ -4426,7 +4531,7 @@ static void handle_window_mailbox(struct Window *w) {
         int q_len = (w->input_tail >= w->input_head) ? 
                     (w->input_tail - w->input_head) : 
                     (INPUT_MAILBOX_SIZE - w->input_head + w->input_tail);
-        lib_printf("[DEBUG] Enter logic START, Q_len=%d, edit_len=%d\n", q_len, w->edit_len);
+        INPUTDBG_PRINTF("[DEBUG] Enter logic START, Q_len=%d, edit_len=%d\n", q_len, w->edit_len);
 
         int is_clear = (strncmp(w->cmd_buf, "clear", 5) == 0);
         int had_input = (w->edit_len > 0);
@@ -4442,6 +4547,9 @@ static void handle_window_mailbox(struct Window *w) {
             }
             w->submit_locked = 1;
             run_command(w);
+            CTRLDBG_PRINTF("[CTRLDBG] post-run win=%d exec=%d submit=%d cancel=%d rows=%d cur_col=%d out='%s'\n",
+                           w->id, w->executing_cmd, w->submit_locked, w->cancel_requested,
+                           w->total_rows, w->cur_col, w->out_buf);
         }
         
         if (w->waiting_wget) return;
@@ -4458,6 +4566,9 @@ static void handle_window_mailbox(struct Window *w) {
                 lib_strcpy(w->lines[w->total_rows-1], PROMPT);
                 w->cur_col = PROMPT_LEN;
             }
+            CTRLDBG_PRINTF("[CTRLDBG] prompt-restored win=%d rows=%d cur_col=%d edit=%d submit=%d exec=%d\n",
+                           w->id, w->total_rows, w->cur_col, w->edit_len,
+                           w->submit_locked, w->executing_cmd);
         } else if (is_clear) {
             redraw_prompt_line(w, 0);
         }
@@ -4530,7 +4641,7 @@ static void handle_window_mailbox(struct Window *w) {
         try_tab_complete(w, r);
     } else if (key >= 32) {
         if (w->edit_len < COLS - PROMPT_LEN - 1) {
-            lib_printf("[DEBUG] Storing char '%c'\n", key);
+            INPUTDBG_PRINTF("[DEBUG] Storing char '%c'\n", key);
             for (int i = w->edit_len; i >= w->cursor_pos; i--) {
                 w->cmd_buf[i + 1] = w->cmd_buf[i];
             }
@@ -4553,6 +4664,10 @@ void terminal_worker_task(void) {
             if ((i % TERMINAL_WORKERS) != worker_id) continue;
             struct Window *w = &wins[i];
             if (!w->active || window_input_empty(w)) continue;
+            CTRLDBG_PRINTF("[CTRLDBG] worker=%d wake win=%d mailbox=%d exec=%d submit=%d q=%d\n",
+                           worker_id, w->id, w->mailbox, w->executing_cmd, w->submit_locked,
+                           (w->input_tail >= w->input_head) ? (w->input_tail - w->input_head) :
+                           (INPUT_MAILBOX_SIZE - w->input_head + w->input_tail));
             do {
                 handle_window_mailbox(w);
                 did_work = 1;
@@ -4793,12 +4908,11 @@ void draw_window(struct Window *w) {
         }
         return;
     }
-    if (w->kind == WINDOW_KIND_GBEMU) {
-        draw_gbemu_content(w, x, y, ww, wh);
-        return;
-    }
     if (w->kind == WINDOW_KIND_EDITOR) {
         editor_render(w, x, y, ww, wh);
+        return;
+    } else if (w->kind == WINDOW_KIND_GBEMU) {
+        draw_gbemu_content(w, x, y, ww, wh);
         return;
     }
     if (w->kind == WINDOW_KIND_FPS_GAME) {
@@ -4833,34 +4947,39 @@ void draw_window(struct Window *w) {
     int char_h = terminal_char_h(w);
     int scale = terminal_font_scale(w);
     int ssr = 0, ssc = 0, ser = 0, sec = 0;
-    int show_sel = (w->kind == WINDOW_KIND_TERMINAL && w->has_selection);
+    int show_sel = (w->kind == WINDOW_KIND_TERMINAL && terminal_has_nonempty_selection(w));
     if (show_sel) terminal_selection_normalized(w, &ssr, &ssc, &ser, &sec);
     for (int i = 0; i < rv; i++) {
         int idx = w->v_offset + i; if (idx < w->total_rows) {
-            int tc = (w->lines[idx][0] == 'd') ? COL_DIR : COL_TEXT;
-            char clipped[COLS];
-            int max_cols = terminal_visible_cols(w);
-            int j = 0;
-            while (j < max_cols && w->lines[idx][j]) {
-                clipped[j] = w->lines[idx][j];
-                j++;
-            }
-            clipped[j] = '\0';
             if (show_sel && idx >= ssr && idx <= ser) {
                 int c0 = (idx == ssr) ? ssc : 0;
                 int c1 = (idx == ser) ? sec : line_text_len(w->lines[idx]);
+                int max_cols = terminal_visible_cols(w);
                 if (c0 < 0) c0 = 0;
                 if (c1 < c0) c1 = c0;
                 if (c0 > max_cols) c0 = max_cols;
                 if (c1 > max_cols) c1 = max_cols;
                 if (c1 > c0) {
-                    draw_rect_fill(x + 10 + c0 * char_w, y + 40 + (i * line_h), (c1 - c0) * char_w, char_h, UI_C_SELECTION);
+                    draw_rect_fill(x + 10 + c0 * char_w, y + 40 + (i * line_h), (c1 - c0) * char_w, line_h, UI_C_SELECTION);
                 }
             }
-            draw_text_scaled(x + 10, y + 40 + (i * line_h), clipped, tc, scale);
+            if (w->kind == WINDOW_KIND_TERMINAL) {
+                int tc = (w->lines[idx][0] == 'd') ? COL_DIR : COL_TEXT;
+                char clipped[COLS];
+                int max_cols = terminal_visible_cols(w);
+                int j = 0;
+                while (j < max_cols && w->lines[idx][j]) {
+                    clipped[j] = w->lines[idx][j];
+                    j++;
+                }
+                clipped[j] = '\0';
+                draw_text_scaled(x + 10, y + 40 + (i * line_h), clipped, tc, scale);
+            }
         }
     }
-    if (active_win_idx == w->id && (((sys_now() / 100U) & 1U) == 0U) && w->total_rows > 0) {
+    if (active_win_idx == w->id &&
+        w->total_rows > 0 &&
+        ((((uint32_t)sys_now()) / 500U) & 1U) == 0U) {
         int cx = x + 10 + (w->cur_col * char_w), cy = y + 40 + ((w->total_rows - 1 - w->v_offset) * line_h);
         if (cx < x + ww - 15 && cy < y + wh - 10 && cy > y + 30) draw_rect_fill(cx, cy, char_w, char_h, COL_TEXT);
     }
@@ -4959,8 +5078,8 @@ void gui_task(void) {
     for(int i=0; i<MAX_WINDOWS; i++) { reset_window(&wins[i], i); z_order[i] = i; }
     lib_printf("[BOOT] gui_task start active_win_idx=%d\n", active_win_idx);
     int last_mx = gui_mx, last_my = gui_my;
-    int last_blink_phase = -1;
     int last_cursor_mode = -1;
+    int last_term_cursor_blink = -1;
     while (1) {
         int redraw_needed = 0;
         int has_demo3d = 0;
@@ -5035,11 +5154,13 @@ void gui_task(void) {
                                 if (!w->maximized) {
                                     w->prev_x = w->x; w->prev_y = w->y; w->prev_w = w->w; w->prev_h = w->h; w->maximized = 1;
                                     w->dragging = 0; w->scroll_dragging = 0; w->resizing = 0; w->resize_dir = RESIZE_NONE;
-                                    if (w->kind == WINDOW_KIND_NETSURF) { w->v_offset = 0; w->ns_h_offset = 0; w->ns_input_active = 0; w->ns_resize_pending = 1; w->ns_resize_last_ms = sys_now(); extern void netsurf_invalidate_layout(int win_id); netsurf_invalidate_layout(idx); }
+                                    if (w->kind == WINDOW_KIND_NETSURF) {
+ w->v_offset = 0; w->ns_h_offset = 0; w->ns_input_active = 0; w->ns_resize_pending = 1; w->ns_resize_last_ms = sys_now(); extern void netsurf_invalidate_layout(int win_id); netsurf_invalidate_layout(idx); }
                                 } else {
                                     w->x = w->prev_x; w->y = w->prev_y; w->w = w->prev_w; w->h = w->prev_h; w->maximized = 0;
                                     w->dragging = 0; w->scroll_dragging = 0; w->resizing = 0; w->resize_dir = RESIZE_NONE;
-                                    if (w->kind == WINDOW_KIND_NETSURF) { w->v_offset = 0; w->ns_h_offset = 0; w->ns_input_active = 0; w->ns_resize_pending = 1; w->ns_resize_last_ms = sys_now(); extern void netsurf_invalidate_layout(int win_id); netsurf_invalidate_layout(idx); }
+                                    if (w->kind == WINDOW_KIND_NETSURF) {
+ w->v_offset = 0; w->ns_h_offset = 0; w->ns_input_active = 0; w->ns_resize_pending = 1; w->ns_resize_last_ms = sys_now(); extern void netsurf_invalidate_layout(int win_id); netsurf_invalidate_layout(idx); }
                                 }
                                 last_click_ms = 0;
                                 w->dragging = 0;
@@ -5074,7 +5195,7 @@ void gui_task(void) {
             redraw_needed = 1;
             if (active_window_valid()) {
                 struct Window *aw = &wins[active_win_idx];
-                if (aw->kind == WINDOW_KIND_TERMINAL) {
+                if (aw->kind == WINDOW_KIND_TERMINAL || aw->kind == WINDOW_KIND_EDITOR) {
                     terminal_paste_clipboard(aw);
                 }
             }
@@ -5200,28 +5321,48 @@ void gui_task(void) {
                 handle_fps_input(&wins[active_win_idx], &gui_key, &redraw_needed);
             } else if (wins[active_win_idx].kind == WINDOW_KIND_GBEMU) {
                 handle_gbemu_input(&wins[active_win_idx], &gui_key);
-            } else if (wins[active_win_idx].kind == WINDOW_KIND_EDITOR) {
+            } else if (wins[active_win_idx].kind == WINDOW_KIND_EDITOR &&
+                       !(gui_ctrl_pressed && (gui_key == 'v' || gui_key == 'V' || gui_key == 22)) &&
+                       gui_key != 3) {
                 window_input_push(&wins[active_win_idx], gui_key);
                 wins[active_win_idx].mailbox = 1;
+                wake_terminal_worker_for_window(active_win_idx);
+                gui_key = 0;
+                key_consumed = 1;
             }
             if (key_consumed) {
                 gui_key = 0;
-            } else if (gui_key == 3 && wins[active_win_idx].kind == WINDOW_KIND_TERMINAL) {
-                if (wins[active_win_idx].has_selection && wins[active_win_idx].edit_len == 0) {
-                    terminal_copy_selection(&wins[active_win_idx]);
-                } else if (wins[active_win_idx].executing_cmd || wins[active_win_idx].waiting_wget) {
+            } else if (gui_key == 3) { // Ctrl+C
+                CTRLDBG_PRINTF("[CTRLDBG] gui win=%d exec=%d wget=%d jit=%d\n",
+                               active_win_idx,
+                               wins[active_win_idx].executing_cmd,
+                               wins[active_win_idx].waiting_wget,
+                               os_jit_owner_active(wins[active_win_idx].id));
+                if (wins[active_win_idx].kind == WINDOW_KIND_TERMINAL &&
+                    (wins[active_win_idx].submit_locked ||
+                     wins[active_win_idx].executing_cmd ||
+                     wins[active_win_idx].waiting_wget ||
+                     os_jit_owner_active(wins[active_win_idx].id))) {
+                    // 如果正在執行命令，執行中斷
                     broadcast_ctrl_c();
-                }
-                else {
+                    gui_key = 0;
+                } else if (wins[active_win_idx].kind == WINDOW_KIND_TERMINAL &&
+                           wins[active_win_idx].has_selection &&
+                           wins[active_win_idx].edit_len == 0) {
+                    // 沒有正在輸入命令時，Ctrl+C 才作為複製選取
+                    terminal_copy_selection(&wins[active_win_idx]);
+                    gui_key = 0;
+                } else if (wins[active_win_idx].kind == WINDOW_KIND_TERMINAL) {
+                    // 其他情況：清空輸入
                     wins[active_win_idx].submit_locked = 0;
                     wins[active_win_idx].cancel_requested = 0;
                     clear_window_input_queue(&wins[active_win_idx]);
                     clear_prompt_input(&wins[active_win_idx]);
                     if (wins[active_win_idx].total_rows > 0) redraw_prompt_line(&wins[active_win_idx], wins[active_win_idx].total_rows - 1);
+                    gui_key = 0;
                 }
-                gui_key = 0;
-            } else if (wins[active_win_idx].kind == WINDOW_KIND_TERMINAL && gui_ctrl_pressed &&
-                       (gui_key == 'v' || gui_key == 'V')) {
+            } else if ((gui_ctrl_pressed && (gui_key == 'v' || gui_key == 'V')) || gui_key == 22) {
+                // 支援所有類型視窗貼上
                 terminal_paste_clipboard(&wins[active_win_idx]);
                 gui_key = 0;
             } else if (wins[active_win_idx].kind == WINDOW_KIND_TERMINAL && gui_ctrl_pressed &&
@@ -5287,17 +5428,21 @@ void gui_task(void) {
                 redraw_needed = 1;
             }
         }
-        {
-            uint32_t blink_now = sys_now();
-            int blink_phase = (int)((blink_now / 100U) & 1U);
-            if (blink_phase != last_blink_phase) {
-                redraw_needed = 1;
-                last_blink_phase = blink_phase;
-            }
-        }
         if (gui_cursor_mode != last_cursor_mode) {
             redraw_needed = 1;
             last_cursor_mode = gui_cursor_mode;
+        }
+        if (active_window_valid() &&
+            wins[active_win_idx].kind == WINDOW_KIND_TERMINAL &&
+            wins[active_win_idx].total_rows > 0) {
+            int blink = (int)(((((uint32_t)sys_now()) / 500U) & 1U) == 0U);
+            if (blink != last_term_cursor_blink) {
+                redraw_needed = 1;
+                last_term_cursor_blink = blink;
+            }
+        } else if (last_term_cursor_blink != -1) {
+            redraw_needed = 1;
+            last_term_cursor_blink = -1;
         }
         if (redraw_needed || (gui_redraw_needed && any_window_active())) {
             static int boot_redraw_logged = 0;

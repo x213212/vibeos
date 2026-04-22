@@ -928,7 +928,146 @@ int ssh_client_sftp_status(char *out, int out_max)
     return 0;
 }
 
-int ssh_client_sftp_ls(const char *remote_path, char *out, int out_max)
+static void sftp_mode_to_str(uint32_t perms, int is_dir, char *out, int out_sz)
+{
+    if (!out || out_sz < 5) return;
+    out[0] = is_dir ? 'd' : '-';
+    out[1] = (perms & 0400U) ? 'r' : '-';
+    out[2] = (perms & 0200U) ? 'w' : '-';
+    out[3] = (perms & 0100U) ? 'x' : '-';
+    out[4] = '\0';
+}
+
+static void sftp_format_size_human(unsigned long bytes, char *out, int out_sz)
+{
+    if (!out || out_sz <= 0) return;
+    if (bytes < 1024ul) {
+        unsigned long v = bytes;
+        char tmp[16];
+        int i = 0, j = 0;
+        if (v == 0) tmp[i++] = '0';
+        while (v > 0 && i < (int)sizeof(tmp) - 1) {
+            tmp[i++] = (char)('0' + (v % 10ul));
+            v /= 10ul;
+        }
+        while (i > 0 && j < out_sz - 2) out[j++] = tmp[--i];
+        out[j++] = 'B';
+        out[j] = '\0';
+    } else if (bytes < 1024ul * 1024ul) {
+        unsigned long v = bytes / 1024ul;
+        char tmp[16];
+        int i = 0, j = 0;
+        if (v == 0) tmp[i++] = '0';
+        while (v > 0 && i < (int)sizeof(tmp) - 1) {
+            tmp[i++] = (char)('0' + (v % 10ul));
+            v /= 10ul;
+        }
+        while (i > 0 && j < out_sz - 2) out[j++] = tmp[--i];
+        out[j++] = 'K';
+        out[j] = '\0';
+    } else {
+        unsigned long v = bytes / (1024ul * 1024ul);
+        char tmp[16];
+        int i = 0, j = 0;
+        if (v == 0) tmp[i++] = '0';
+        while (v > 0 && i < (int)sizeof(tmp) - 1) {
+            tmp[i++] = (char)('0' + (v % 10ul));
+            v /= 10ul;
+        }
+        while (i > 0 && j < out_sz - 2) out[j++] = tmp[--i];
+        out[j++] = 'M';
+        out[j] = '\0';
+    }
+}
+
+static void sftp_append_u2(char *out, unsigned int v)
+{
+    out[0] = (char)('0' + ((v / 10U) % 10U));
+    out[1] = (char)('0' + (v % 10U));
+}
+
+static void sftp_append_u4(char *out, unsigned int v)
+{
+    out[0] = (char)('0' + ((v / 1000U) % 10U));
+    out[1] = (char)('0' + ((v / 100U) % 10U));
+    out[2] = (char)('0' + ((v / 10U) % 10U));
+    out[3] = (char)('0' + (v % 10U));
+}
+
+static void sftp_format_utc_datetime(unsigned long total, char *out, int out_sz)
+{
+    unsigned long days;
+    unsigned long sod;
+    unsigned int hour, min, sec;
+    long z, era, doe, yoe, y, doy, mp, d, m;
+    unsigned int year;
+
+    if (!out || out_sz < 20) {
+        if (out && out_sz > 0) out[0] = '\0';
+        return;
+    }
+
+    days = total / 86400ul;
+    sod = total % 86400ul;
+    hour = (unsigned int)(sod / 3600ul);
+    min = (unsigned int)((sod / 60ul) % 60ul);
+    sec = (unsigned int)(sod % 60ul);
+
+    z = (long)days + 719468L;
+    era = (z >= 0 ? z : z - 146096L) / 146097L;
+    doe = z - era * 146097L;
+    yoe = (doe - doe / 1460L + doe / 36524L - doe / 146096L) / 365L;
+    y = yoe + era * 400L;
+    doy = doe - (365L * yoe + yoe / 4L - yoe / 100L);
+    mp = (5L * doy + 2L) / 153L;
+    d = doy - (153L * mp + 2L) / 5L + 1L;
+    m = mp + (mp < 10L ? 3L : -9L);
+    year = (unsigned int)(y + (m <= 2L));
+
+    sftp_append_u4(out, year);
+    out[4] = '-';
+    sftp_append_u2(out + 5, (unsigned int)m);
+    out[7] = '-';
+    sftp_append_u2(out + 8, (unsigned int)d);
+    out[10] = ' ';
+    sftp_append_u2(out + 11, hour);
+    out[13] = ':';
+    sftp_append_u2(out + 14, min);
+    out[16] = ':';
+    sftp_append_u2(out + 17, sec);
+    out[19] = '\0';
+}
+
+static void sftp_append_str(char *out, int out_max, int *pos, const char *s)
+{
+    if (!out || !pos || !s || *pos >= out_max - 1) return;
+    while (*s && *pos < out_max - 1) {
+        out[*pos] = *s;
+        (*pos)++;
+        s++;
+    }
+    out[*pos] = '\0';
+}
+
+static void sftp_append_pad(char *out, int out_max, int *pos, const char *s, int width)
+{
+    int used = 0;
+    if (width < 0) width = 0;
+    while (s && *s && *pos < out_max - 1 && used < width) {
+        out[*pos] = *s;
+        (*pos)++;
+        s++;
+        used++;
+    }
+    while (*pos < out_max - 1 && used < width) {
+        out[*pos] = ' ';
+        (*pos)++;
+        used++;
+    }
+    out[*pos] = '\0';
+}
+
+int ssh_client_sftp_ls(const char *remote_path, int all, char *out, int out_max)
 {
     LIBSSH2_SESSION *session = NULL;
     struct ssh_transport *transport = NULL;
@@ -936,6 +1075,8 @@ int ssh_client_sftp_ls(const char *remote_path, char *out, int out_max)
     LIBSSH2_SFTP_HANDLE *dir = NULL;
     char full[192];
     uint32_t start;
+    uint32_t read_start;
+    int pos = 0;
     int rc = -1;
 
     if (!out || out_max <= 0) return -1;
@@ -963,25 +1104,64 @@ int ssh_client_sftp_ls(const char *remote_path, char *out, int out_max)
     }
 
     out[0] = '\0';
+    read_start = sys_now();
     for (;;) {
         char name[96];
         LIBSSH2_SFTP_ATTRIBUTES attrs;
         int n = libssh2_sftp_readdir(dir, name, sizeof(name) - 1, &attrs);
         if (n == LIBSSH2_ERROR_EAGAIN) {
+            if ((uint32_t)(sys_now() - read_start) > SSH_EXEC_TIMEOUT_MS) {
+                ssh_set_msg(out, out_max, "ERR: SFTP readdir timeout.");
+                goto done;
+            }
             ssh_transport_pump();
             continue;
         }
         if (n <= 0) break;
+        read_start = sys_now();
         name[n] = '\0';
-        if ((int)strlen(out) + n + 32 >= out_max) break;
-        if ((attrs.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) &&
-            LIBSSH2_SFTP_S_ISDIR(attrs.permissions)) {
-            lib_strcat(out, "d ");
-        } else {
-            lib_strcat(out, "f ");
+        if (!all && ((name[0] == '.' && name[1] == '\0') ||
+                     (name[0] == '.' && name[1] == '.' && name[2] == '\0'))) {
+            continue;
         }
-        lib_strcat(out, name);
-        lib_strcat(out, "\n");
+        {
+            int is_dir = ((attrs.flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) &&
+                          LIBSSH2_SFTP_S_ISDIR(attrs.permissions));
+            int wrote = 0;
+            if (all) {
+                char mode[8];
+                char sz[16];
+                char ts[24];
+                char kind[2];
+                unsigned long mtime = (attrs.flags & LIBSSH2_SFTP_ATTR_ACMODTIME) ? attrs.mtime : 0ul;
+                unsigned long fsize = (attrs.flags & LIBSSH2_SFTP_ATTR_SIZE) ? (unsigned long)attrs.filesize : 0ul;
+                sftp_mode_to_str(attrs.permissions, is_dir, mode, sizeof(mode));
+                sftp_format_size_human(fsize, sz, sizeof(sz));
+                sftp_format_utc_datetime(mtime, ts, sizeof(ts));
+                kind[0] = is_dir ? 'd' : 'f';
+                kind[1] = '\0';
+                sftp_append_pad(out, out_max, &pos, mode, 5);
+                sftp_append_str(out, out_max, &pos, " ");
+                sftp_append_pad(out, out_max, &pos, sz, 8);
+                sftp_append_str(out, out_max, &pos, " ");
+                sftp_append_pad(out, out_max, &pos, ts, 19);
+                sftp_append_str(out, out_max, &pos, " ");
+                sftp_append_str(out, out_max, &pos, kind);
+                sftp_append_str(out, out_max, &pos, " ");
+                sftp_append_str(out, out_max, &pos, name);
+                sftp_append_str(out, out_max, &pos, "\n");
+                wrote = 1;
+            } else {
+                wrote = snprintf(out + pos, out_max - pos, "%c %s\n", is_dir ? 'd' : 'f', name);
+            }
+            if (wrote < 0) break;
+            if (!all && wrote >= out_max - pos) {
+                pos = out_max - 1;
+                out[pos] = '\0';
+                break;
+            }
+            if (!all) pos += wrote;
+        }
     }
     if (out[0] == '\0') lib_strcpy(out, "(empty)");
     rc = 0;

@@ -11,7 +11,7 @@ int ssh_client_get_wrp_url(char *out, int out_max);
 int ssh_client_exec_remote(const char *cmd, char *out, int out_max);
 int ssh_client_sftp_mount(const char *remote_root, char *out, int out_max);
 int ssh_client_sftp_status(char *out, int out_max);
-int ssh_client_sftp_ls(const char *remote_path, char *out, int out_max);
+int ssh_client_sftp_ls(const char *remote_path, int all, char *out, int out_max);
 int ssh_client_sftp_get(struct Window *w, const char *remote_path, const char *local_path, char *out, int out_max);
 int ssh_client_sftp_put(struct Window *w, const char *local_path, const char *remote_path, char *out, int out_max);
 int ssh_client_sftp_read_alloc(const char *remote_path, unsigned char **data, uint32_t *size, char *out, int out_max);

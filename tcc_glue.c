@@ -107,6 +107,7 @@ void tcc_error_report(void *opaque, const char *msg) { lib_printf("TCC Error: %s
 #define JIT_SHARED_SIZE (1024u * 1024u)
 #define JIT_MAX_KPTRS 32
 #define JIT_MAX_FDS 32
+#define JIT_TIMESLICE_MS 10u
 
 enum {
     JIT_JOB_EMPTY = 0,
@@ -133,6 +134,7 @@ struct jit_job {
     int waiter_task_id;
     int cancel_requested;
     int exit_code;
+    unsigned int slice_start_ms;
     TCCState *tcc;
     int (*main_func)(void);
     uint8_t *uheap;
@@ -148,6 +150,8 @@ static int jit_next_id = 1;
 static int jit_initialized = 0;
 
 void os_jit_init(void);
+static void jit_yield(void);
+static void jit_maybe_yield(void);
 
 static struct jit_job *jit_current_job(void) {
     int tid = task_current();
@@ -163,6 +167,19 @@ static int jit_check_cancel(void) {
     return job->cancel_requested != 0;
 }
 
+static void jit_maybe_yield(void) {
+    struct jit_job *job = jit_current_job();
+    if (!job) return;
+    if (job->cancel_requested) {
+        jit_yield();
+        return;
+    }
+    unsigned int now = get_millisecond_timer();
+    if ((unsigned int)(now - job->slice_start_ms) < JIT_TIMESLICE_MS) return;
+    job->slice_start_ms = now;
+    jit_yield();
+}
+
 static void jit_yield(void) {
     struct jit_job *job = jit_current_job();
     if (job && job->cancel_requested) {
@@ -172,7 +189,18 @@ static void jit_yield(void) {
         if (job->bg) task_sleep_current();
         return;
     }
+    if (job) job->slice_start_ms = get_millisecond_timer();
     if (task_current() >= 0) task_os();
+}
+
+static unsigned int jit_get_ticks(void) {
+    jit_maybe_yield();
+    return get_millisecond_timer();
+}
+
+static unsigned int jit_sys_now(void) {
+    jit_maybe_yield();
+    return sys_now();
 }
 
 void os_delay(unsigned int ms) {
@@ -278,6 +306,7 @@ static int jit_untrack_fd(struct jit_job *job, int fd) {
 static void *jit_kmalloc(size_t size) {
     struct jit_job *job = jit_current_job();
     if (!job || job->cancel_requested) return NULL;
+    jit_maybe_yield();
     void *p = malloc(size);
     if (!p) return NULL;
     if (jit_track_kptr(job, p) != 0) {
@@ -290,6 +319,7 @@ static void *jit_kmalloc(size_t size) {
 static void jit_kfree(void *p) {
     struct jit_job *job = jit_current_job();
     if (!p) return;
+    jit_maybe_yield();
     if (job && jit_untrack_kptr(job, p) == 0) {
         free(p);
     }
@@ -298,6 +328,7 @@ static void jit_kfree(void *p) {
 static int jit_appfs_open(const char *path, int flags) {
     struct jit_job *job = jit_current_job();
     if (!job || job->cancel_requested) return -1;
+    jit_maybe_yield();
     int fd = appfs_open(path, flags);
     if (fd < 0) return fd;
     if (jit_track_fd(job, fd) != 0) {
@@ -309,8 +340,25 @@ static int jit_appfs_open(const char *path, int flags) {
 
 static int jit_appfs_close(int fd) {
     struct jit_job *job = jit_current_job();
+    jit_maybe_yield();
     if (job) jit_untrack_fd(job, fd);
     return appfs_close(fd);
+}
+
+static int jit_appfs_read(int fd, void *buf, size_t size) {
+    if (jit_check_cancel()) return -1;
+    jit_maybe_yield();
+    int rc = appfs_read(fd, buf, size);
+    jit_maybe_yield();
+    return rc;
+}
+
+static int jit_appfs_write(int fd, const void *buf, size_t size) {
+    if (jit_check_cancel()) return -1;
+    jit_maybe_yield();
+    int rc = appfs_write(fd, buf, size);
+    jit_maybe_yield();
+    return rc;
 }
 
 static void jit_uheap_reset(struct jit_job *job) {
@@ -338,6 +386,7 @@ static void *umalloc(size_t size) {
     struct jit_job *job = jit_current_job();
     if (!job) return NULL;
     if (job->cancel_requested) return NULL;
+    jit_maybe_yield();
     if (!job->uheap_head) jit_uheap_reset(job);
     uint32_t need = jit_align8(size ? (uint32_t)size : 1u);
     struct jit_ublock *b = job->uheap_head;
@@ -367,6 +416,7 @@ static void ufree(void *p) {
     struct jit_job *job = jit_current_job();
     if (!job) return;
     if (job->cancel_requested) return;
+    jit_maybe_yield();
     uint8_t *addr = (uint8_t *)p;
     if (addr < job->uheap + sizeof(struct jit_ublock) ||
         addr >= job->uheap + JIT_UHEAP_SIZE) {
@@ -384,6 +434,7 @@ static void ufree(void *p) {
 
 static void *ucalloc(uint32_t nmemb, uint32_t size) {
     if (jit_check_cancel()) return NULL;
+    jit_maybe_yield();
     uint32_t total = nmemb * size;
     if (size && total / size != nmemb) return NULL;
     void *p = umalloc(total ? total : 1u);
@@ -393,6 +444,7 @@ static void *ucalloc(uint32_t nmemb, uint32_t size) {
 
 static void *urealloc(void *ptr, size_t size) {
     if (jit_check_cancel()) return NULL;
+    jit_maybe_yield();
     if (!ptr) return umalloc(size);
     if (size == 0) {
         ufree(ptr);
@@ -467,6 +519,7 @@ static const char jit_prelude[] =
     "void *kmalloc(size_t size);\n"
     "void kfree(void *p);\n"
     "void yield(void);\n"
+    "void jit_poll(void);\n"
     "int cancelled(void);\n"
     "void *shared_mem(void);\n"
     "uint32_t shared_size(void);\n"
@@ -503,11 +556,174 @@ static const char jit_prelude[] =
     "void draw_bevel_rect(int x, int y, int w, int h, int fill, int light, int dark);\n"
     "void draw_round_rect_fill(int x, int y, int w, int h, int r, int color);\n"
     "void draw_round_rect_wire(int x, int y, int w, int h, int r, int color);\n"
+    "const char *clipboard_get(void);\n"
+    "void clipboard_set(const char *text);\n"
     "int appfs_open(const char *path, int flags);\n"
     "int appfs_read(int fd, void *buf, size_t size);\n"
     "int appfs_write(int fd, const void *buf, size_t size);\n"
     "int appfs_close(int fd);\n"
     "enum { WIDTH = 1024, HEIGHT = 768 };\n";
+
+enum jit_instrument_state {
+    JIT_INST_NONE = 0,
+    JIT_INST_WAIT_PAREN,
+    JIT_INST_IN_HEADER,
+    JIT_INST_WAIT_BLOCK,
+    JIT_INST_WAIT_DO_BLOCK
+};
+
+static int jit_is_space(char c) {
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f' || c == '\v';
+}
+
+static int jit_is_ident_char(char c) {
+    return (c >= '0' && c <= '9') ||
+           (c >= 'a' && c <= 'z') ||
+           (c >= 'A' && c <= 'Z') ||
+           c == '_';
+}
+
+static char *jit_instrument_loops(const char *source) {
+    static const char inject[] = "{ jit_poll(); ";
+    size_t src_len = source ? strlen(source) : 0;
+    char *out = (char *)malloc(src_len * 2 + 64);
+    if (!out) return NULL;
+    size_t oi = 0;
+    int state = JIT_INST_NONE;
+    int paren_depth = 0;
+    int in_line_comment = 0;
+    int in_block_comment = 0;
+    int in_string = 0;
+    int in_char = 0;
+
+    for (size_t i = 0; i < src_len; i++) {
+        char c = source[i];
+        char n = (i + 1 < src_len) ? source[i + 1] : '\0';
+
+        if (in_line_comment) {
+            out[oi++] = c;
+            if (c == '\n') in_line_comment = 0;
+            continue;
+        }
+        if (in_block_comment) {
+            out[oi++] = c;
+            if (c == '*' && n == '/') {
+                out[oi++] = n;
+                i++;
+                in_block_comment = 0;
+            }
+            continue;
+        }
+        if (in_string) {
+            out[oi++] = c;
+            if (c == '\\' && n) {
+                out[oi++] = n;
+                i++;
+                continue;
+            }
+            if (c == '"') in_string = 0;
+            continue;
+        }
+        if (in_char) {
+            out[oi++] = c;
+            if (c == '\\' && n) {
+                out[oi++] = n;
+                i++;
+                continue;
+            }
+            if (c == '\'') in_char = 0;
+            continue;
+        }
+
+        if (c == '/' && n == '/') {
+            out[oi++] = c;
+            out[oi++] = n;
+            i++;
+            in_line_comment = 1;
+            continue;
+        }
+        if (c == '/' && n == '*') {
+            out[oi++] = c;
+            out[oi++] = n;
+            i++;
+            in_block_comment = 1;
+            continue;
+        }
+        if (c == '"') {
+            out[oi++] = c;
+            in_string = 1;
+            continue;
+        }
+        if (c == '\'') {
+            out[oi++] = c;
+            in_char = 1;
+            continue;
+        }
+
+        if ((c == 'f' && i + 2 < src_len && !strncmp(source + i, "for", 3) &&
+             (i == 0 || !jit_is_ident_char(source[i - 1])) &&
+             !jit_is_ident_char(source[i + 3])) ||
+            (c == 'w' && i + 4 < src_len && !strncmp(source + i, "while", 5) &&
+             (i == 0 || !jit_is_ident_char(source[i - 1])) &&
+             !jit_is_ident_char(source[i + 5]))) {
+            size_t kw_len = (c == 'f') ? 3 : 5;
+            for (size_t k = 0; k < kw_len; k++) out[oi++] = source[i + k];
+            i += kw_len - 1;
+            state = JIT_INST_WAIT_PAREN;
+            paren_depth = 0;
+            continue;
+        }
+        if (c == 'd' && i + 1 < src_len && !strncmp(source + i, "do", 2) &&
+            (i == 0 || !jit_is_ident_char(source[i - 1])) &&
+            !jit_is_ident_char(source[i + 2])) {
+            out[oi++] = 'd';
+            out[oi++] = 'o';
+            i += 1;
+            state = JIT_INST_WAIT_DO_BLOCK;
+            continue;
+        }
+
+        out[oi++] = c;
+
+        if (state == JIT_INST_WAIT_PAREN) {
+            if (c == '(') {
+                state = JIT_INST_IN_HEADER;
+                paren_depth = 1;
+            } else if (!jit_is_space(c)) {
+                state = JIT_INST_NONE;
+            }
+            continue;
+        }
+        if (state == JIT_INST_IN_HEADER) {
+            if (c == '(') paren_depth++;
+            else if (c == ')') {
+                paren_depth--;
+                if (paren_depth == 0) state = JIT_INST_WAIT_BLOCK;
+            }
+            continue;
+        }
+        if (state == JIT_INST_WAIT_BLOCK) {
+            if (jit_is_space(c)) continue;
+            if (c == '{') {
+                memcpy(out + oi, inject + 1, sizeof(inject) - 2);
+                oi += sizeof(inject) - 2;
+            }
+            state = JIT_INST_NONE;
+            continue;
+        }
+        if (state == JIT_INST_WAIT_DO_BLOCK) {
+            if (jit_is_space(c)) continue;
+            if (c == '{') {
+                memcpy(out + oi, inject + 1, sizeof(inject) - 2);
+                oi += sizeof(inject) - 2;
+            }
+            state = JIT_INST_NONE;
+            continue;
+        }
+    }
+    out[oi] = '\0';
+    return out;
+}
 
 static void jit_add_symbol_logged(TCCState *s, const char *name, const void *val) {
     tcc_add_symbol(s, name, val);
@@ -527,6 +743,7 @@ static void jit_add_os_symbols(TCCState *s) {
     jit_add_symbol_logged(s, "kmalloc", (void*)jit_kmalloc);
     jit_add_symbol_logged(s, "kfree", (void*)jit_kfree);
     jit_add_symbol_logged(s, "yield", (void*)jit_yield);
+    jit_add_symbol_logged(s, "jit_poll", (void*)jit_maybe_yield);
     jit_add_symbol_logged(s, "cancelled", (void*)jit_check_cancel);
     jit_add_symbol_logged(s, "shared_mem", (void*)jit_shared_mem);
     jit_add_symbol_logged(s, "shared_size", (void*)jit_shared_size);
@@ -543,9 +760,9 @@ static void jit_add_os_symbols(TCCState *s) {
     jit_add_symbol_logged(s, "atoi", (void*)atoi);
     jit_add_symbol_logged(s, "abs", (void*)abs);
 
-    jit_add_symbol_logged(s, "get_ticks", (void*)get_millisecond_timer);
-    jit_add_symbol_logged(s, "millis", (void*)get_millisecond_timer);
-    jit_add_symbol_logged(s, "sys_now", (void*)sys_now);
+    jit_add_symbol_logged(s, "get_ticks", (void*)jit_get_ticks);
+    jit_add_symbol_logged(s, "millis", (void*)jit_get_ticks);
+    jit_add_symbol_logged(s, "sys_now", (void*)jit_sys_now);
     jit_add_symbol_logged(s, "get_wall_clock_seconds", (void*)get_wall_clock_seconds);
     jit_add_symbol_logged(s, "delay", (void*)os_delay);
 
@@ -562,21 +779,33 @@ static void jit_add_os_symbols(TCCState *s) {
     jit_add_symbol_logged(s, "draw_round_rect_fill", (void*)draw_round_rect_fill);
     jit_add_symbol_logged(s, "draw_round_rect_wire", (void*)draw_round_rect_wire);
 
+    extern const char *clipboard_get(void);
+    extern void clipboard_set(const char *text);
+    jit_add_symbol_logged(s, "clipboard_get", (void*)clipboard_get);
+    jit_add_symbol_logged(s, "clipboard_set", (void*)clipboard_set);
+
     jit_add_symbol_logged(s, "appfs_open", (void*)jit_appfs_open);
-    jit_add_symbol_logged(s, "appfs_read", (void*)appfs_read);
-    jit_add_symbol_logged(s, "appfs_write", (void*)appfs_write);
+
+    jit_add_symbol_logged(s, "appfs_read", (void*)jit_appfs_read);
+    jit_add_symbol_logged(s, "appfs_write", (void*)jit_appfs_write);
     jit_add_symbol_logged(s, "appfs_close", (void*)jit_appfs_close);
 }
 
 static char *jit_make_source_with_prelude(const char *source) {
     size_t prelude_len = strlen(jit_prelude);
-    size_t source_len = source ? strlen(source) : 0;
+    char *instrumented = jit_instrument_loops(source ? source : "");
+    if (!instrumented) return NULL;
+    size_t source_len = strlen(instrumented);
     char *combined = (char *)malloc(prelude_len + source_len + 2);
-    if (!combined) return NULL;
+    if (!combined) {
+        free(instrumented);
+        return NULL;
+    }
     memcpy(combined, jit_prelude, prelude_len);
     combined[prelude_len] = '\n';
-    if (source_len) memcpy(combined + prelude_len + 1, source, source_len);
+    if (source_len) memcpy(combined + prelude_len + 1, instrumented, source_len);
     combined[prelude_len + 1 + source_len] = '\0';
+    free(instrumented);
     return combined;
 }
 
@@ -665,6 +894,7 @@ static void jit_job_execute(struct jit_job *job) {
     job->task_id = task_current();
     job->state = JIT_JOB_RUNNING;
     job->cancel_requested = 0;
+    job->slice_start_ms = get_millisecond_timer();
     asm volatile("fence.i");
     lib_printf("[JITDBG] job=%d call main\n", job->id);
     job->exit_code = job->main_func();
@@ -700,6 +930,13 @@ static void (*jit_task_entries[JIT_MAX_JOBS])(void) = {
     jit_task0, jit_task1, jit_task2, jit_task3
 };
 
+__attribute__((noreturn)) void os_jit_cancel_trampoline(void) {
+    task_sleep_current();
+    for (;;) {
+        task_os();
+    }
+}
+
 void os_jit_init(void) {
     if (jit_initialized) return;
     for (int i = 0; i < JIT_MAX_JOBS; i++) {
@@ -713,21 +950,21 @@ void os_jit_init(void) {
     jit_initialized = 1;
 }
 
-void os_jit_run(const char *source) {
-    struct jit_job *job = jit_alloc_job(0, -1);
+int os_jit_run(const char *source, int owner_win_id) {
+    struct jit_job *job = jit_alloc_job(0, owner_win_id);
     char msg[96];
     if (!job) {
         lib_printf("JIT: no free job slot\n");
-        return;
+        return -1;
     }
     int slot = (int)(job - jit_jobs);
     if (jit_compile_job(job, source, msg, sizeof(msg)) != 0) {
         lib_printf("%s\n", msg[0] ? msg : "JIT: failed");
         jit_job_cleanup(job);
-        return;
+        return -1;
     }
     job->bg = 0;
-    job->owner_win_id = -1;
+    job->owner_win_id = owner_win_id;
     job->waiter_task_id = task_current();
     if (job->task_id < 0 || job->task_id == job->waiter_task_id) {
         job->task_id = task_create(jit_task_entries[slot], 0, 1);
@@ -738,6 +975,10 @@ void os_jit_run(const char *source) {
     while (job->state == JIT_JOB_READY || job->state == JIT_JOB_RUNNING) {
         task_sleep_current();
     }
+    lib_printf("[CTRLDBG] os_jit_run return owner=%d job=%d rc=%d state=%d waiter=%d task=%d\n",
+               owner_win_id, job->id, job->exit_code, job->state,
+               job->waiter_task_id, job->task_id);
+    return job->exit_code;
 }
 
 int os_jit_run_bg(const char *source, int owner_win_id, char *msg, size_t msg_size) {
@@ -820,12 +1061,80 @@ int os_jit_cancel_task(int task_id) {
             }
             jit_jobs[i].state = JIT_JOB_FAILED;
             jit_jobs[i].exit_code = -2;
+            int waiter = jit_jobs[i].waiter_task_id;
+            int job_id = jit_jobs[i].id;
             jit_job_cleanup(&jit_jobs[i]);
-            if (!jit_jobs[i].bg && jit_jobs[i].waiter_task_id >= 0) {
-                task_wake(jit_jobs[i].waiter_task_id);
+            if (waiter >= 0 && waiter != task_current()) {
+                task_wake(waiter);
             }
-            return jit_jobs[i].id;
+            return job_id;
         }
     }
     return -1;
+}
+
+int os_jit_cancel_by_owner(int owner_win_id) {
+    int count = 0;
+    for (int i = 0; i < JIT_MAX_JOBS; i++) {
+        if (jit_jobs[i].owner_win_id != owner_win_id) continue;
+        if (jit_jobs[i].state != JIT_JOB_COMPILING &&
+            jit_jobs[i].state != JIT_JOB_READY &&
+            jit_jobs[i].state != JIT_JOB_RUNNING) continue;
+        {
+            lib_printf("[CTRLDBG] cancel owner=%d job=%d slot=%d state=%d task=%d waiter=%d\n",
+                       owner_win_id, jit_jobs[i].id, i, jit_jobs[i].state,
+                       jit_jobs[i].task_id, jit_jobs[i].waiter_task_id);
+            jit_jobs[i].cancel_requested = 1;
+            if (jit_jobs[i].task_id >= 0) {
+                task_reset(jit_jobs[i].task_id, jit_task_entries[i], 0, 1);
+                task_sleep(jit_jobs[i].task_id);
+            }
+            jit_jobs[i].state = JIT_JOB_FAILED;
+            jit_jobs[i].exit_code = -2;
+            int waiter = jit_jobs[i].waiter_task_id;
+            jit_job_cleanup(&jit_jobs[i]);
+            if (waiter >= 0 && waiter != task_current()) {
+                task_wake(waiter);
+            }
+            count++;
+        }
+    }
+    return count;
+}
+
+int os_jit_cancel_running_owner_from_trap(int owner_win_id) {
+    int current = task_current();
+    for (int i = 0; i < JIT_MAX_JOBS; i++) {
+        if (jit_jobs[i].state == JIT_JOB_EMPTY) continue;
+        if (jit_jobs[i].state != JIT_JOB_RUNNING) continue;
+        if (jit_jobs[i].owner_win_id != owner_win_id) continue;
+        if (jit_jobs[i].task_id != current) continue;
+        lib_printf("[CTRLDBG] trap-cancel owner=%d job=%d slot=%d state=%d task=%d waiter=%d\n",
+                   owner_win_id, jit_jobs[i].id, i, jit_jobs[i].state,
+                   jit_jobs[i].task_id, jit_jobs[i].waiter_task_id);
+        jit_jobs[i].cancel_requested = 1;
+        jit_jobs[i].state = JIT_JOB_FAILED;
+        jit_jobs[i].exit_code = -2;
+        int waiter = jit_jobs[i].waiter_task_id;
+        jit_job_cleanup(&jit_jobs[i]);
+        if (waiter >= 0 && waiter != current) {
+            task_wake(waiter);
+        }
+        return 1;
+    }
+    return 0;
+}
+
+int os_jit_owner_active(int owner_win_id) {
+    for (int i = 0; i < JIT_MAX_JOBS; i++) {
+        if (jit_jobs[i].owner_win_id != owner_win_id) continue;
+        if (jit_jobs[i].state == JIT_JOB_COMPILING ||
+            jit_jobs[i].state == JIT_JOB_READY ||
+            jit_jobs[i].state == JIT_JOB_RUNNING) {
+            lib_printf("[CTRLDBG] owner_active owner=%d job=%d slot=%d state=%d\n",
+                       owner_win_id, jit_jobs[i].id, i, jit_jobs[i].state);
+            return 1;
+        }
+    }
+    return 0;
 }

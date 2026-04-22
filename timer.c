@@ -15,7 +15,7 @@
 // qemu virt CLINT mtime runs at 10MHz in the normal configuration used by the
 // current Makefile (no -icount), so 1ms = 10000 ticks.
 #define MTIME_TICKS_PER_MS 10000ULL
-#define INTERVAL 1000000ULL
+#define INTERVAL 100000ULL
 static inline unsigned long long read_mtime_real(void) {
     volatile uint32_t *mtime = (volatile uint32_t *)(uintptr_t)CLINT_MTIME;
     uint32_t hi, lo;
