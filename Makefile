@@ -142,8 +142,9 @@ QFLAGS = -smp 1 -machine virt -m 1G -bios none \
          -monitor telnet:localhost:4321,server,nowait
 
 ENABLE_AUDIO ?= 0
+PULSE_SERVER_PATH ?= /mnt/wslg/PulseServer
 ifeq ($(ENABLE_AUDIO),1)
-QFLAGS += -audiodev pa,id=snd0,server=unix:/mnt/wslg/PulseServer -device AC97,audiodev=snd0
+QEMU_AUDIO_FLAGS = -audiodev pa,id=snd0,server=unix:$(PULSE_SERVER_PATH) -device AC97,audiodev=snd0
 endif
 
 HDD_BACKUP_DIR ?= hdd_backups
@@ -173,7 +174,17 @@ $(BUILD_DIR)/%.o: %.s
 -include $(DEPS)
 
 qemu: os.elf hdd.dsk backup-hdd
-	$(QEMU) $(QFLAGS) -kernel os.elf
+	@if [ "$(ENABLE_AUDIO)" = "1" ]; then \
+		if [ -S "$(PULSE_SERVER_PATH)" ]; then \
+			echo "QEMU audio: PulseAudio socket found at $(PULSE_SERVER_PATH)"; \
+			PULSE_SERVER=unix:$(PULSE_SERVER_PATH) $(QEMU) $(QFLAGS) $(QEMU_AUDIO_FLAGS) -kernel os.elf; \
+		else \
+			echo "QEMU audio: PulseAudio socket not found at $(PULSE_SERVER_PATH), falling back to no audio."; \
+			$(QEMU) $(QFLAGS) -kernel os.elf; \
+		fi; \
+	else \
+		$(QEMU) $(QFLAGS) -kernel os.elf; \
+	fi
 
 backup-hdd: hdd.dsk
 	@mkdir -p $(HDD_BACKUP_DIR)
