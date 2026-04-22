@@ -5324,9 +5324,7 @@ void gui_task(void) {
             } else if (wins[active_win_idx].kind == WINDOW_KIND_EDITOR &&
                        !(gui_ctrl_pressed && (gui_key == 'v' || gui_key == 'V' || gui_key == 22)) &&
                        gui_key != 3) {
-                window_input_push(&wins[active_win_idx], gui_key);
-                wins[active_win_idx].mailbox = 1;
-                wake_terminal_worker_for_window(active_win_idx);
+                editor_handle_key(&wins[active_win_idx], (char)gui_key);
                 gui_key = 0;
                 key_consumed = 1;
             }
@@ -5375,8 +5373,6 @@ void gui_task(void) {
                 if (wins[active_win_idx].kind == WINDOW_KIND_TERMINAL) {
                     window_input_push(&wins[active_win_idx], gui_key);
                     wins[active_win_idx].mailbox = 1;
-                    wake_terminal_worker_for_window(active_win_idx);
-                } else if (wins[active_win_idx].kind == WINDOW_KIND_EDITOR) {
                     wake_terminal_worker_for_window(active_win_idx);
                 }
                 gui_key = 0;
