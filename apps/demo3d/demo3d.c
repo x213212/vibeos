@@ -1,4 +1,5 @@
 #include "user.h"
+#include "user_graphics.h"
 
 static int parse_i32(const char *s, int *used, int *out) {
     int i = 0, sign = 1, v = 0;

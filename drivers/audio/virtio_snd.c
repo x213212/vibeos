@@ -1,7 +1,8 @@
 #include "virtio.h"
 #include "virtio_snd.h"
-#include "user_internal.h"
+#include "gbemu_app.h"
 #include "os.h"
+#include "string.h"
 
 #define R_SND(addr) ((volatile uint32 *)(VIRTIO_SND_BASE + (addr)))
 #define SND_QUEUES 4

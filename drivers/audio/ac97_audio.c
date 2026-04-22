@@ -1,4 +1,8 @@
-#include "user_internal.h"
+#include "ac97_audio.h"
+#include "gbemu_app.h"
+#include "lib.h"
+#include "string.h"
+#include "types.h"
 
 #define AC97_PCI_ECAM_BASE 0x30000000UL
 #define AC97_PCI_PIO_WINDOW 0x03000000UL

@@ -13,24 +13,28 @@ WCAP_DIR = $(THIRD_PARTY_DIR)/libwapcaplet
 PUTIL_DIR = $(THIRD_PARTY_DIR)/libparserutils
 HUB_DIR = $(THIRD_PARTY_DIR)/libhubbub
 TCC_DIR = $(THIRD_PARTY_DIR)/tcc-riscv32
+LWIP_DIR = $(THIRD_PARTY_DIR)/lwip
+GBEMU_DIR = $(THIRD_PARTY_DIR)/gbemu
+WRP_DIR = $(THIRD_PARTY_DIR)/wrp
 
 CFLAGS = -nostdlib -fno-builtin -mcmodel=medany -march=rv32imac -mabi=ilp32 -DLWIP_NO_CTYPE_H -DWITHOUT_ICONV_FILTER -g -Wall -w \
          -mno-relax \
-         -I./ -I./lwip/src/include -I./lwip/src/core -I./lwip/src/netif \
-         -I./gbemu_wasm/include \
+         -I./ -I./runtime/jit -I./ports/mbedtls -I$(LWIP_DIR)/src/include -I$(LWIP_DIR)/src/core -I$(LWIP_DIR)/src/netif \
+         -I./apps/gbemu -I./apps/netsurf -I./apps/net/wget -I./apps/ssh -I./drivers/audio \
+         -I$(GBEMU_DIR)/include \
          -I$(LIBSSH2_DIR)/include -I$(LIBSSH2_DIR)/src \
          -I$(NSFB_DIR)/include -I$(NSFB_DIR)/src \
          -I$(WCAP_DIR)/include \
          -I$(PUTIL_DIR)/include -I$(PUTIL_DIR)/src \
          -I$(HUB_DIR)/include -I$(HUB_DIR)/src \
          -I$(TCC_DIR) -DTCC_TARGET_RISCV32 -DONE_SOURCE=1 -DCONFIG_TCC_STATIC -DCONFIG_TCC_PREDEFS=1 \
-         -include netsurf_port.h \
+         -include apps/netsurf/netsurf_port.h \
          -Dprintf=lib_printf \
          -I$(MBEDTLS_DIR)/include -I$(MBEDTLS_DIR)/tf-psa-crypto/include -I$(MBEDTLS_DIR)/tf-psa-crypto/core -I$(MBEDTLS_DIR)/tf-psa-crypto/drivers/builtin/include -I$(MBEDTLS_DIR)/tf-psa-crypto/drivers/builtin/src -I$(MBEDTLS_DIR)/tf-psa-crypto/utilities \
          -DMBEDTLS_CONFIG_FILE=\"$(MBEDTLS_DIR)/configs/config-suite-b.h\" \
-         -DMBEDTLS_USER_CONFIG_FILE=\"mbedtls_os_config.h\" \
+         -DMBEDTLS_USER_CONFIG_FILE=\"ports/mbedtls/mbedtls_os_config.h\" \
          -DTF_PSA_CRYPTO_CONFIG_FILE=\"$(MBEDTLS_DIR)/configs/crypto-config-suite-b.h\" \
-         -DTF_PSA_CRYPTO_USER_CONFIG_FILE=\"tf_psa_crypto_os_config.h\" \
+         -DTF_PSA_CRYPTO_USER_CONFIG_FILE=\"ports/mbedtls/tf_psa_crypto_os_config.h\" \
          -DMBEDTLS_MD_C -DMBEDTLS_MD_LIGHT -DMBEDTLS_CIPHER_C -DMBEDTLS_RSA_C \
          -DHAVE_CONFIG_H \
          -DHOST_BUILD_YEAR=$(shell date +%Y) -DHOST_BUILD_MONTH=$(shell date +%-m) -DHOST_BUILD_DAY=$(shell date +%-d) \
@@ -77,14 +81,34 @@ HUB_SOURCES = $(HUB_DIR)/src/parser.c $(HUB_DIR)/src/tokeniser/tokeniser.c $(HUB
               $(HUB_DIR)/src/treebuilder/after_after_frameset.c $(HUB_DIR)/src/treebuilder/in_foreign_content.c \
               $(HUB_DIR)/src/treebuilder/generic_rcdata.c $(HUB_DIR)/src/treebuilder/element-type.c
 
-OBJ = start.s sys.s mem.s lib.c timer.c task.c os.c user.c user_utils.c user_netsurf.c tool_editor.c user_wget.c ssh_client.c fs.c 3d.c tool_asm.c app_runtime.c trap.c lock.c plic.c string.c vga.c font.c alloc.c tcc_glue.c $(TCC_DIR)/libtcc.c mbedtls_entropy_compat.c mbedtls_port.c \
-      mbedtls_compat.c \
-      compat_time.c virtio_disk.c virtio_net.c virtio_input.c ac97_audio.c gbemu_runtime.c gbemu_audio_stub.c \
-      gbemu_wasm/lib/cart.c gbemu_wasm/lib/cpu.c gbemu_wasm/lib/cpu_fetch.c gbemu_wasm/lib/cpu_proc.c \
-      gbemu_wasm/lib/cpu_util.c gbemu_wasm/lib/dbg.c gbemu_wasm/lib/dma.c gbemu_wasm/lib/gamepad.c \
-      gbemu_wasm/lib/interrupts.c gbemu_wasm/lib/instructions.c gbemu_wasm/lib/io.c gbemu_wasm/lib/lcd.c \
-      gbemu_wasm/lib/ppu.c gbemu_wasm/lib/ppu_pipeline.c gbemu_wasm/lib/ppu_sm.c gbemu_wasm/lib/ram.c \
-      gbemu_wasm/lib/stack.c gbemu_wasm/lib/bus.c gbemu_wasm/lib/timer.c \
+CORE_SOURCES = start.s sys.s mem.s lib.c timer.c task.c os.c fs.c runtime/jit/jit_debugger.c app_runtime.c trap.c lock.c plic.c string.c vga.c font.c alloc.c \
+      runtime/jit/tcc_glue.c $(TCC_DIR)/libtcc.c ports/mbedtls/mbedtls_entropy_compat.c ports/mbedtls/mbedtls_port.c ports/mbedtls/mbedtls_compat.c compat_time.c
+
+USER_SOURCES = user.c user_terminal.c user_gui.c user_fs_shell.c user_editor.c user_graphics.c user_cmd.c user_utils.c
+
+APP_SOURCES = apps/netsurf/netsurf.c apps/editor/tool_editor.c apps/editor/tool_asm.c apps/net/wget/user_wget.c apps/ssh/ssh_client.c \
+      apps/demo3d/demo3d.c apps/gbemu/gbemu_runtime.c apps/gbemu/gbemu_audio_stub.c
+
+DRIVER_SOURCES = drivers/virtio/virtio_disk.c drivers/virtio/virtio_net.c drivers/virtio/virtio_input.c drivers/audio/ac97_audio.c
+
+GBEMU_CORE_SOURCES = $(GBEMU_DIR)/lib/cart.c $(GBEMU_DIR)/lib/cpu.c $(GBEMU_DIR)/lib/cpu_fetch.c $(GBEMU_DIR)/lib/cpu_proc.c \
+      $(GBEMU_DIR)/lib/cpu_util.c $(GBEMU_DIR)/lib/dbg.c $(GBEMU_DIR)/lib/dma.c $(GBEMU_DIR)/lib/gamepad.c \
+      $(GBEMU_DIR)/lib/interrupts.c $(GBEMU_DIR)/lib/instructions.c $(GBEMU_DIR)/lib/io.c $(GBEMU_DIR)/lib/lcd.c \
+      $(GBEMU_DIR)/lib/ppu.c $(GBEMU_DIR)/lib/ppu_pipeline.c $(GBEMU_DIR)/lib/ppu_sm.c $(GBEMU_DIR)/lib/ram.c \
+      $(GBEMU_DIR)/lib/stack.c $(GBEMU_DIR)/lib/bus.c $(GBEMU_DIR)/lib/timer.c
+
+LWIP_SOURCES = $(LWIP_DIR)/src/core/def.c $(LWIP_DIR)/src/core/init.c $(LWIP_DIR)/src/core/mem.c $(LWIP_DIR)/src/core/memp.c \
+      $(LWIP_DIR)/src/core/altcp.c $(LWIP_DIR)/src/core/altcp_alloc.c $(LWIP_DIR)/src/core/altcp_tcp.c \
+      $(LWIP_DIR)/src/core/netif.c $(LWIP_DIR)/src/core/pbuf.c $(LWIP_DIR)/src/core/raw.c $(LWIP_DIR)/src/core/sys.c \
+      $(LWIP_DIR)/src/core/tcp.c $(LWIP_DIR)/src/core/tcp_in.c $(LWIP_DIR)/src/core/tcp_out.c $(LWIP_DIR)/src/core/udp.c \
+      $(LWIP_DIR)/src/core/ip.c $(LWIP_DIR)/src/core/dns.c $(LWIP_DIR)/src/netif/ethernet.c $(LWIP_DIR)/src/netif/lowpan6.c \
+      $(LWIP_DIR)/src/core/timeouts.c $(LWIP_DIR)/src/core/inet_chksum.c \
+      $(LWIP_DIR)/src/core/ipv4/ip4.c $(LWIP_DIR)/src/core/ipv4/acd.c $(LWIP_DIR)/src/core/ipv4/autoip.c \
+      $(LWIP_DIR)/src/core/ipv4/igmp.c $(LWIP_DIR)/src/core/ipv4/ip4_addr.c $(LWIP_DIR)/src/core/ipv4/icmp.c \
+      $(LWIP_DIR)/src/core/ipv4/dhcp.c $(LWIP_DIR)/src/core/ipv4/etharp.c $(LWIP_DIR)/src/core/ipv4/ip4_frag.c \
+      $(LWIP_DIR)/src/apps/altcp_tls/altcp_tls_mbedtls.c $(LWIP_DIR)/src/apps/altcp_tls/altcp_tls_mbedtls_mem.c
+
+THIRD_PARTY_SOURCES = $(GBEMU_CORE_SOURCES) \
       $(NSFB_SOURCES) $(PUTIL_SOURCES) $(HUB_SOURCES) \
       $(LIBSSH2_DIR)/src/agent.c $(LIBSSH2_DIR)/src/bcrypt_pbkdf.c $(LIBSSH2_DIR)/src/chacha.c \
       $(LIBSSH2_DIR)/src/channel.c $(LIBSSH2_DIR)/src/cipher-chachapoly.c $(LIBSSH2_DIR)/src/comp.c \
@@ -118,18 +142,12 @@ OBJ = start.s sys.s mem.s lib.c timer.c task.c os.c user.c user_utils.c user_net
       $(MBEDTLS_DIR)/tf-psa-crypto/utilities/base64.c \
       $(MBEDTLS_DIR)/tf-psa-crypto/utilities/pem.c \
       $(MBEDTLS_DIR)/tf-psa-crypto/utilities/oid.c \
-      lwip/src/core/def.c lwip/src/core/init.c lwip/src/core/mem.c lwip/src/core/memp.c \
-      lwip/src/core/altcp.c lwip/src/core/altcp_alloc.c lwip/src/core/altcp_tcp.c \
-      lwip/src/core/netif.c lwip/src/core/pbuf.c lwip/src/core/raw.c lwip/src/core/sys.c \
-      lwip/src/core/tcp.c lwip/src/core/tcp_in.c lwip/src/core/tcp_out.c lwip/src/core/udp.c \
-      lwip/src/core/ip.c lwip/src/core/dns.c lwip/src/netif/ethernet.c lwip/src/netif/lowpan6.c \
-      lwip/src/core/timeouts.c lwip/src/core/inet_chksum.c \
-      lwip/src/core/ipv4/ip4.c lwip/src/core/ipv4/acd.c lwip/src/core/ipv4/autoip.c \
-      lwip/src/core/ipv4/igmp.c lwip/src/core/ipv4/ip4_addr.c lwip/src/core/ipv4/icmp.c \
-      lwip/src/core/ipv4/dhcp.c lwip/src/core/ipv4/etharp.c lwip/src/core/ipv4/ip4_frag.c \
-      lwip/src/apps/altcp_tls/altcp_tls_mbedtls.c lwip/src/apps/altcp_tls/altcp_tls_mbedtls_mem.c
+      $(LWIP_SOURCES)
+
+OBJ = $(CORE_SOURCES) $(USER_SOURCES) $(APP_SOURCES) $(DRIVER_SOURCES) $(THIRD_PARTY_SOURCES)
 
 QEMU = qemu-system-riscv32
+QEMU_DISPLAY ?= :0
 QFLAGS = -smp 1 -machine virt -m 1G -bios none \
          -drive if=none,format=raw,file=hdd.dsk,id=x0 \
          -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
@@ -177,13 +195,13 @@ qemu: os.elf hdd.dsk backup-hdd
 	@if [ "$(ENABLE_AUDIO)" = "1" ]; then \
 		if [ -S "$(PULSE_SERVER_PATH)" ]; then \
 			echo "QEMU audio: PulseAudio socket found at $(PULSE_SERVER_PATH)"; \
-			PULSE_SERVER=unix:$(PULSE_SERVER_PATH) $(QEMU) $(QFLAGS) $(QEMU_AUDIO_FLAGS) -kernel os.elf; \
+			DISPLAY=$(QEMU_DISPLAY) PULSE_SERVER=unix:$(PULSE_SERVER_PATH) $(QEMU) $(QFLAGS) $(QEMU_AUDIO_FLAGS) -kernel os.elf; \
 		else \
 			echo "QEMU audio: PulseAudio socket not found at $(PULSE_SERVER_PATH), falling back to no audio."; \
-			$(QEMU) $(QFLAGS) -kernel os.elf; \
+			DISPLAY=$(QEMU_DISPLAY) $(QEMU) $(QFLAGS) -kernel os.elf; \
 		fi; \
 	else \
-		$(QEMU) $(QFLAGS) -kernel os.elf; \
+		DISPLAY=$(QEMU_DISPLAY) $(QEMU) $(QFLAGS) -kernel os.elf; \
 	fi
 
 backup-hdd: hdd.dsk

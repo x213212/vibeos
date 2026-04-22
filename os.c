@@ -1,8 +1,8 @@
 #include "os.h"
 #include "vga.h"
+#include "mbedtls_port.h"
 
 extern void trap_init(void);
-extern void mbedtls_os_init(void);
 extern void virtio_disk_init(void);
 extern void virtio_net_init(void);
 extern void virtio_keyboard_init(void);

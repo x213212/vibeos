@@ -4,7 +4,6 @@
 #include <stdint.h>
 #include "os.h"
 #include "vga.h"
-#include "user_wget.h"
 #include "virtio.h"
 
 #define MAX_WINDOWS 12
@@ -53,6 +52,7 @@
 #define WINDOW_KIND_EDITOR 4
 #define WINDOW_KIND_NETSURF 5
 #define WINDOW_KIND_GBEMU 6
+#define WINDOW_KIND_JIT_DEBUGGER 7
 
 #define MAX_DIR_ENTRIES 120
 struct file_entry { char name[20]; uint32_t bno, size, ctime, mtime; uint16_t mode, type; };
@@ -128,6 +128,12 @@ struct Window {
     int ssh_auth_mode, ssh_auth_len;
     char editor_name[20], editor_cwd[128], editor_status[EDITOR_STATUS_LEN];
     char editor_path[128];
+    char debug_entry_path[128];
+    int debug_split_x, debug_split_y, debug_drag_split;
+    int debug_regs_scroll_x, debug_regs_scroll_y;
+    int debug_mem_scroll_x, debug_mem_scroll_y;
+    int debug_source_scroll_x, debug_source_scroll_y;
+    int debug_console_scroll_x, debug_console_scroll_y;
     char editor_lines[EDITOR_MAX_LINES][EDITOR_LINE_LEN];
     char editor_cmd[COLS];
     int editor_mode, editor_line_count, editor_cursor_row, editor_cursor_col;
@@ -174,6 +180,8 @@ struct Window {
 
 extern struct Window wins[MAX_WINDOWS];
 extern int active_win_idx;
+extern int gui_task_id;
+void gui_task(void);
 extern struct Window fs_tmp_window;
 extern unsigned char file_io_buf[];
 
@@ -184,6 +192,20 @@ int find_free_entry_index(struct dir_block *db);
 uint32_t current_fs_time(void);
 void copy_name20(char *dst, const char *src);
 void format_size_human(uint32_t bytes, char *out);
+void append_out_str(char *out, int out_max, const char *s);
+void append_out_pad(char *out, int out_max, const char *s, int width);
+void append_dir_entries_sorted(struct dir_block *db, const char *title, const char *name_prefix, int type_filter, char *out);
+void list_dir_contents(uint32_t bno, char *out);
+const char *path_basename(const char *p);
+void copy_last_path_segment(char *dst, const char *path, const char *fallback);
+void path_set_child(char *cwd, const char *name);
+void path_set_parent(char *cwd);
+int path_is_sftp(const char *path);
+const char *sftp_subpath(const char *path);
+int copy_between_paths(struct Window *w, const char *src, const char *dst, char *out, int out_max);
+int local_path_info(struct Window *w, const char *path, int *type_out, uint32_t *bno_out, char *name_out);
+int copy_local_dir_recursive(struct Window *w, uint32_t src_bno, const char *dst_path, char *out, int out_max);
+int copy_sftp_dir_to_local_recursive(struct Window *w, const char *src_remote, const char *dst_path, char *out, int out_max);
 void reset_window(struct Window *w, int idx);
 uint32_t balloc(void);
 void bfree(uint32_t bno);
@@ -196,6 +218,9 @@ int move_entry_named(struct Window *w, const char *src, const char *dst);
 int resolve_fs_target(struct Window *term, const char *input, uint32_t *dir_bno_out, char *cwd_out, char *leaf_out);
 int load_file_bytes(struct Window *w, const char *name, unsigned char *dst, uint32_t max_size, uint32_t *out_size);
 int load_file_bytes_alloc(struct Window *w, const char *name, unsigned char **dst, uint32_t *out_size);
+int resolve_editor_target(struct Window *term, const char *input, uint32_t *dir_bno_out, char *cwd_out, char *leaf_out);
+void build_editor_path(char *dst, const char *cwd, const char *name);
+void shorten_path_for_title(char *dst, const char *src, int max_len);
 void appfs_set_cwd(uint32_t cwd_bno, const char *cwd);
 void redraw_prompt_line(struct Window *w, int row);
 int terminal_font_scale(struct Window *w);
@@ -207,7 +232,9 @@ const char *terminal_clipboard_text(void);
 void terminal_finish_ctrl_c_cancel(struct Window *w, int killed);
 int store_file_bytes(struct Window *w, const char *name, const unsigned char *data, uint32_t size);
 void close_window(int idx);
+void bring_to_front(int idx);
 void wake_terminal_worker_for_window(int win_idx);
+void terminal_worker_task(void);
 void editor_set_status(struct Window *w, const char *msg);
 void editor_clear(struct Window *w);
 void editor_load_bytes(struct Window *w, const unsigned char *src, uint32_t size);
@@ -215,6 +242,7 @@ int editor_load_file_window(struct Window *w, uint32_t start_line);
 void editor_handle_key(struct Window *w, char key);
 void editor_render(struct Window *w, int x, int y, int ww, int wh);
 int open_text_editor(struct Window *term, const char *name);
+int open_image_file(struct Window *term, const char *name);
 int parse_demo3d_points(char *spec, int pts[8][3], int *count);
 int open_demo3d_window_points(int pts[8][3], int count);
 int open_demo3d_cube_window(void);
@@ -237,6 +265,15 @@ int cos_deg(int deg);
 const char *terminal_env_get(struct Window *w, const char *name);
 int terminal_env_set(struct Window *w, const char *name, const char *value);
 int terminal_env_unset(struct Window *w, const char *name);
+void terminal_load_bashrc(struct Window *w);
+void terminal_load_sshboot(struct Window *w);
+void terminal_source_script(struct Window *w, const char *path);
+int sshboot_password_obfuscate(const char *password, char *out, int out_max);
+int terminal_alias_set(struct Window *w, const char *name, const char *value);
+int terminal_alias_unset(struct Window *w, const char *name);
+const char *terminal_alias_get(struct Window *w, const char *name);
+void terminal_app_stdout_flush(struct Window *w);
+int terminal_has_nonempty_selection(struct Window *w);
 
 extern void (*loaded_app_entry)(void);
 extern reg_t loaded_app_resume_pc;

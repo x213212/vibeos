@@ -1,3 +1,4 @@
+#include "user_editor.h"
 #include "user_internal.h"
 
 #define TASKBAR_H 30
@@ -7,13 +8,6 @@
 #define COL_SYNTAX_COMMENT UI_C_TEXT_DIM
 #define COL_SYNTAX_STRING UI_C_PANEL_HOVER
 #define COL_SYNTAX_PREPROC UI_C_PANEL_ACTIVE
-
-extern void editor_handle_key(struct Window *w, char key);
-extern void editor_load_bytes(struct Window *w, const unsigned char *src, uint32_t size);
-extern int editor_load_file_window(struct Window *w, uint32_t start_line);
-extern void editor_clear(struct Window *w);
-extern void editor_set_status(struct Window *w, const char *msg);
-extern void editor_render(struct Window *w, int x, int y, int ww, int wh);
 
 void editor_set_status(struct Window *w, const char *msg) {
     if (!msg) msg = "";

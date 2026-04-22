@@ -79,7 +79,7 @@ cmake -S ./third_party/mbedtls \
   -DUSE_STATIC_TF_PSA_CRYPTO_LIBRARY=ON \
   -DUSE_SHARED_TF_PSA_CRYPTO_LIBRARY=OFF \
   -DMBEDTLS_CONFIG_FILE=$(pwd)/third_party/mbedtls/configs/config-suite-b.h \
-  -DMBEDTLS_USER_CONFIG_FILE=$(pwd)/mbedtls_os_config.h \
+  -DMBEDTLS_USER_CONFIG_FILE=$(pwd)/ports/mbedtls/mbedtls_os_config.h \
   -DMBEDTLS_FATAL_WARNINGS=OFF \
   -DMBEDTLS_AS_SUBPROJECT=OFF \
   -DMBEDTLS_TARGET_PREFIX=rv_
@@ -105,7 +105,7 @@ Compile WRP server:
 
 ```sh
 # Host shell
-cd wrp
+cd third_party/wrp
 GOPATH=/tmp/gopath GOMODCACHE=/tmp/gopath/pkg/mod GOCACHE=/tmp/go-build go build -o wrp ./...
 ```
 
@@ -113,7 +113,7 @@ Start WRP server (keep this shell open):
 
 ```sh
 # Host shell, terminal 1
-cd wrp
+cd third_party/wrp
 ./wrp -l :9999 -b /opt/google/chrome/chrome -ua "" -s 1s
 ```
 
@@ -181,7 +181,7 @@ ssh exec <command>
 
 - TCP/IP: Uses [lwIP](https://github.com/lwip-tcpip/lwip) as the TCP/IP stack within the guest OS.
 - Network device: QEMU `virtio-net-device`, connected to `192.168.123.100/24` via host `tap0`.
-- HTTP client: Built-in `user_wget.c`, running on lwIP TCP sockets, used to download WRP HTML, GIP/GIF images, and general HTTP files.
+- HTTP client: Built-in `apps/net/wget/user_wget.c`, running on lwIP TCP sockets, used to download WRP HTML, GIP/GIF images, and general HTTP files.
 - SSH protocol: Uses [libssh2](https://github.com/libssh2/libssh2) for the SSH-2 client protocol.
 - SSH crypto backend: libssh2 uses the [mbedTLS](https://github.com/Mbed-TLS/mbedtls) backend via `third_party/libssh2/src/mbedtls.c`.
 - TLS / crypto primitives: mbedTLS provides RSA, AES, SHA, HMAC, CTR-DRBG, X.509, PK parsing, etc.
@@ -233,15 +233,26 @@ vibe-os repo root/
   Makefile              OS build / QEMU startup settings
   os.elf                Compiled RISC-V kernel / userspace image
   hdd.dsk               QEMU virtio block disk image
-  user.c                Shell, GUI, window, terminal commands
-  user_netsurf.c        NetSurf/WRP frontend, mouse/keyboard/wheel queue
-  user_utils.c          URL normalization, WRP URL generation, GIF/GIP decoder
-  user_wget.c/.h        HTTP client / WGET queue
-  ssh_client.c/.h       SSH settings and WRP URL persistence
-  virtio_net.c          virtio-net + lwIP netif
-  lwip/                 lwIP source tree
-  gbemu_wasm/           Game Boy emulator core
-  wrp/                  Modified WRP server
+  user.c                User/session bootstrap and shared state
+  user_terminal.c/.h    Terminal input, history, env, aliases, worker loop
+  user_cmd.c/.h         Shell command dispatch and command handlers
+  user_gui.c/.h         GUI window manager, taskbar, resize/focus loop
+  user_graphics.c/.h    Image opening and clipped drawing helpers
+  user_fs_shell.c/.h    Shell-facing FS, path, copy, SFTP path helpers
+  user_editor.c/.h      Editor window opening / lazy load glue
+  runtime/jit/          TCC/JIT runtime and debugger UI glue
+  ports/mbedtls/        OS mbedTLS/TF-PSA compatibility layer
+  apps/netsurf/         NetSurf/WRP frontend
+  apps/net/wget/        HTTP client / WGET queue
+  apps/ssh/             SSH settings, SSH exec, SFTP helpers
+  apps/editor/          Text editor and asm tool implementation
+  apps/demo3d/          Demo 3D / FPS drawing tools
+  apps/gbemu/           Game Boy app wrapper and audio shim
+  drivers/virtio/       virtio block, net, keyboard/tablet
+  drivers/audio/        AC97 and virtio sound drivers
+  third_party/lwip/     lwIP source tree
+  third_party/gbemu/    Game Boy emulator C core
+  third_party/wrp/      Modified WRP host-side server
 ```
 
 ## Host / Guest Network Configuration
@@ -256,9 +267,9 @@ IP Planning:
 
 | Endpoint | IP / port | Description |
 | --- | --- | --- |
-| QEMU guest OS | `192.168.123.1/24` | Defined in `virtio_net.c` |
+| QEMU guest OS | `192.168.123.1/24` | Defined in `drivers/virtio/virtio_net.c` |
 | Host tap0 | `192.168.123.100/24` | Host running WRP server |
-| WRP default URL | `http://192.168.123.100:9999` | Defined in `ssh_client.c` |
+| WRP default URL | `http://192.168.123.100:9999` | Defined in `apps/ssh/ssh_client.c` |
 
 ## Build Instructions
 

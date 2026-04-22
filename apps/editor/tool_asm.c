@@ -1,4 +1,5 @@
 #include "user.h"
+#include "user_wget.h"
 
 #define ASM_MAX_LINES 256
 #define ASM_MAX_LABELS 64
