@@ -23,6 +23,11 @@ enum float_abi {
     ARM_HARD_FLOAT,
 };
 
+ST_FUNC int is_hi_reloc( int type )
+{
+    return 0;
+}
+
 #else /* !TARGET_DEFS_ONLY */
 
 #include "tcc.h"

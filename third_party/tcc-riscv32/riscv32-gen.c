@@ -147,16 +147,148 @@ static void ER(
 
 static void EI( uint32_t opcode, uint32_t func3, uint32_t rd, uint32_t rs1, uint32_t imm )
 {
-    assert( !( ( imm + ( 1 << 11 ) ) >> 12 ) );
-    EIu( opcode, func3, rd, rs1, imm );
+    int32_t simm = (int32_t)imm;
+    assert( simm >= -2048 && simm <= 2047 );
+    EIu( opcode, func3, rd, rs1, (uint32_t)simm & 0xfffu );
 }
 
 static void ES( uint32_t opcode, uint32_t func3, uint32_t rs1, uint32_t rs2, uint32_t imm )
 {
-    assert( !( ( imm + ( 1 << 11 ) ) >> 12 ) );
-    o( opcode | ( func3 << 12 ) | ( ( imm & 0x1f ) << 7 ) | ( rs1 << 15 ) | ( rs2 << 20 ) |
-        ( ( imm >> 5 ) << 25 ) );
+    uint32_t word;
+    int32_t simm = (int32_t)imm;
+    assert( simm >= -2048 && simm <= 2047 );
+    imm = (uint32_t)simm & 0xfffu;
+    word = opcode | ( func3 << 12 ) | ( ( imm & 0x1f ) << 7 ) | ( rs1 << 15 ) | ( rs2 << 20 ) |
+        ( ( imm >> 5 ) << 25 );
+    if (word == 0x23u) {
+        printf("[JITGEN] bad ES ind=%x opcode=%x f3=%x rs1=%x rs2=%x imm=%x word=%x\n",
+               ind, opcode, func3, rs1, rs2, imm, word);
+    }
+    o( word );
 }
+
+static void EB( uint32_t opcode, uint32_t func3, uint32_t rs1, uint32_t rs2, uint32_t imm )
+{
+    uint32_t off = imm;
+    assert( (((int32_t)off + ( 1 << 12 )) & ~(int32_t)0x1ffe) == 0 );
+    o( opcode | ( func3 << 12 ) | ( rs1 << 15 ) | ( rs2 << 20 ) |
+       ( ( off & 0x800u ) << 20 ) | ( ( off & 0x3f0u ) << 21 ) |
+       ( ( off & 0x00eu ) << 7 ) | ( ( off & 0x400u ) >> 3 ) );
+}
+
+static void EJ( uint32_t opcode, uint32_t rd, uint32_t imm )
+{
+    uint32_t off = imm;
+    assert( (((int32_t)off + ( 1 << 20 )) & ~(((int32_t)1 << 21) - 2)) == 0 );
+    o( opcode | ( rd << 7 ) | ( ( ( off >> 12 ) & 0xffu ) << 12 ) |
+       ( ( ( off >> 11 ) & 1u ) << 20 ) |
+       ( ( ( off >> 1 ) & 0x3ffu ) << 21 ) |
+       ( ( ( off >> 20 ) & 1u ) << 31 ) );
+}
+
+/*
+ * Keep codegen on the local encoders above. The assembler helpers in
+ * riscv_utils.h are shared with the inline assembler/PLT paths, but using
+ * them here has produced partially encoded stores during prologue patching.
+ */
+#undef emit_LW
+#undef emit_LB
+#undef emit_LH
+#undef emit_LBU
+#undef emit_LHU
+#undef emit_SW
+#undef emit_SB
+#undef emit_SH
+#undef emit_ADDI
+#undef emit_SLTI
+#undef emit_SLTIU
+#undef emit_XORI
+#undef emit_ORI
+#undef emit_ANDI
+#undef emit_SLLI
+#undef emit_SRLI
+#undef emit_SRAI
+#undef emit_JALR
+#undef emit_JAL
+#undef emit_J_inst
+#undef emit_RET
+#undef emit_MV
+#undef emit_ADD
+#undef emit_SUB
+#undef emit_SLL
+#undef emit_SLT
+#undef emit_SLTU
+#undef emit_XOR
+#undef emit_SRL
+#undef emit_SRA
+#undef emit_OR
+#undef emit_AND
+#undef emit_MUL
+#undef emit_DIV
+#undef emit_DIVU
+#undef emit_REM
+#undef emit_REMU
+#undef emit_SEQZ
+#undef emit_SNEZ
+#undef emit_NOP
+#undef emit_LI
+#undef emit_LUI
+#undef emit_AUIPC
+#undef emit_BEQ
+#undef emit_BNE
+#undef emit_BLT
+#undef emit_BGE
+#undef emit_BLTU
+#undef emit_BGEU
+#define emit_LW(rd, rs1, imm)       EI(0x03, 0x2, (rd), (rs1), (uint32_t)(imm))
+#define emit_LB(rd, rs1, imm)       EI(0x03, 0x0, (rd), (rs1), (uint32_t)(imm))
+#define emit_LH(rd, rs1, imm)       EI(0x03, 0x1, (rd), (rs1), (uint32_t)(imm))
+#define emit_LBU(rd, rs1, imm)      EI(0x03, 0x4, (rd), (rs1), (uint32_t)(imm))
+#define emit_LHU(rd, rs1, imm)      EI(0x03, 0x5, (rd), (rs1), (uint32_t)(imm))
+#define emit_SW(rs1, rs2, imm)      ES(0x23, 0x2, (rs1), (rs2), (uint32_t)(imm))
+#define emit_SB(rs1, rs2, imm)      ES(0x23, 0x0, (rs1), (rs2), (uint32_t)(imm))
+#define emit_SH(rs1, rs2, imm)      ES(0x23, 0x1, (rs1), (rs2), (uint32_t)(imm))
+#define emit_ADDI(rd, rs1, imm)     EI(0x13, 0x0, (rd), (rs1), (uint32_t)(imm))
+#define emit_SLTI(rd, rs1, imm)     EI(0x13, 0x2, (rd), (rs1), (uint32_t)(imm))
+#define emit_SLTIU(rd, rs1, imm)    EI(0x13, 0x3, (rd), (rs1), (uint32_t)(imm))
+#define emit_XORI(rd, rs1, imm)     EI(0x13, 0x4, (rd), (rs1), (uint32_t)(imm))
+#define emit_ORI(rd, rs1, imm)      EI(0x13, 0x6, (rd), (rs1), (uint32_t)(imm))
+#define emit_ANDI(rd, rs1, imm)     EI(0x13, 0x7, (rd), (rs1), (uint32_t)(imm))
+#define emit_SLLI(rd, rs1, shamt)   ER(0x13, 0x1, (rd), (rs1), (shamt), 0x00)
+#define emit_SRLI(rd, rs1, shamt)   ER(0x13, 0x5, (rd), (rs1), (shamt), 0x00)
+#define emit_SRAI(rd, rs1, shamt)   ER(0x13, 0x5, (rd), (rs1), (shamt), 0x20)
+#define emit_JALR(rd, rs1, imm)     EI(0x67, 0x0, (rd), (rs1), (uint32_t)(imm))
+#define emit_JAL(rd, imm)           EJ(0x6f, (rd), (uint32_t)(imm))
+#define emit_J_inst(offset)         emit_JAL(0, (offset))
+#define emit_RET()                  emit_JALR(0, 1, 0)
+#define emit_MV(rd, rs)             emit_ADDI((rd), (rs), 0)
+#define emit_ADD(rd, rs1, rs2)      ER(0x33, 0x0, (rd), (rs1), (rs2), 0x00)
+#define emit_SUB(rd, rs1, rs2)      ER(0x33, 0x0, (rd), (rs1), (rs2), 0x20)
+#define emit_SLL(rd, rs1, rs2)      ER(0x33, 0x1, (rd), (rs1), (rs2), 0x00)
+#define emit_SLT(rd, rs1, rs2)      ER(0x33, 0x2, (rd), (rs1), (rs2), 0x00)
+#define emit_SLTU(rd, rs1, rs2)     ER(0x33, 0x3, (rd), (rs1), (rs2), 0x00)
+#define emit_XOR(rd, rs1, rs2)      ER(0x33, 0x4, (rd), (rs1), (rs2), 0x00)
+#define emit_SRL(rd, rs1, rs2)      ER(0x33, 0x5, (rd), (rs1), (rs2), 0x00)
+#define emit_SRA(rd, rs1, rs2)      ER(0x33, 0x5, (rd), (rs1), (rs2), 0x20)
+#define emit_OR(rd, rs1, rs2)       ER(0x33, 0x6, (rd), (rs1), (rs2), 0x00)
+#define emit_AND(rd, rs1, rs2)      ER(0x33, 0x7, (rd), (rs1), (rs2), 0x00)
+#define emit_MUL(rd, rs1, rs2)      ER(0x33, 0x0, (rd), (rs1), (rs2), 0x01)
+#define emit_DIV(rd, rs1, rs2)      ER(0x33, 0x4, (rd), (rs1), (rs2), 0x01)
+#define emit_DIVU(rd, rs1, rs2)     ER(0x33, 0x5, (rd), (rs1), (rs2), 0x01)
+#define emit_REM(rd, rs1, rs2)      ER(0x33, 0x6, (rd), (rs1), (rs2), 0x01)
+#define emit_REMU(rd, rs1, rs2)     ER(0x33, 0x7, (rd), (rs1), (rs2), 0x01)
+#define emit_SEQZ(rd, rs)           emit_SLTIU((rd), (rs), 1)
+#define emit_SNEZ(rd, rs)           emit_SLTU((rd), 0, (rs))
+#define emit_NOP()                  emit_ADDI(0, 0, 0)
+#define emit_LI(rd, imm)            emit_LUI((rd), IMM_HIGH((imm) + 0x800)); emit_ADDI((rd), (rd), IMM_LOW(imm));
+#define emit_LUI(rd, imm)           o(((uint32_t)(imm) << 12) | ((rd) << 7) | 0x37)
+#define emit_AUIPC(rd, imm)         o(((uint32_t)(imm) << 12) | ((rd) << 7) | 0x17)
+#define emit_BEQ(rs1, rs2, imm)     EB(0x63, 0x0, (rs1), (rs2), (uint32_t)(imm))
+#define emit_BNE(rs1, rs2, imm)     EB(0x63, 0x1, (rs1), (rs2), (uint32_t)(imm))
+#define emit_BLT(rs1, rs2, imm)     EB(0x63, 0x4, (rs1), (rs2), (uint32_t)(imm))
+#define emit_BGE(rs1, rs2, imm)     EB(0x63, 0x5, (rs1), (rs2), (uint32_t)(imm))
+#define emit_BLTU(rs1, rs2, imm)    EB(0x63, 0x6, (rs1), (rs2), (uint32_t)(imm))
+#define emit_BGEU(rs1, rs2, imm)    EB(0x63, 0x7, (rs1), (rs2), (uint32_t)(imm))
 
 /*
  * loads symbol offsets from the symbol on the value stack and puts it in register r.
@@ -1125,16 +1257,31 @@ ST_FUNC void gfunc_epilog( void )
     saved_ind = ind;
 
     ind = func_sub_sp_offset;
+    printf("[JITGEN] prolog patch start off=%x saved=%x loc=%d d=%d v=%d va=%d\n",
+           func_sub_sp_offset, saved_ind, loc, d, v, num_va_regs);
     emit_ADDI( sp, sp, -d );
+    printf("[JITGEN] prolog word off=%x w=%x addi-sp\n",
+           func_sub_sp_offset, read32le(cur_text_section->data + func_sub_sp_offset));
     emit_SW( sp, ra, d - PTR_SIZE - num_va_regs * PTR_SIZE );
+    printf("[JITGEN] prolog word off=%x w=%x sw-ra imm=%d\n",
+           func_sub_sp_offset + 4, read32le(cur_text_section->data + func_sub_sp_offset + 4),
+           d - PTR_SIZE - num_va_regs * PTR_SIZE);
     emit_SW( sp, s0, d - 2 * PTR_SIZE - num_va_regs * PTR_SIZE );
+    printf("[JITGEN] prolog word off=%x w=%x sw-s0 imm=%d\n",
+           func_sub_sp_offset + 8, read32le(cur_text_section->data + func_sub_sp_offset + 8),
+           d - 2 * PTR_SIZE - num_va_regs * PTR_SIZE);
 
     if( v < ( 1 << 11 ) )
         emit_ADDI( s0, sp, d - num_va_regs * PTR_SIZE );
     else
         gjmp_addr( large_ofs_ind );
+    printf("[JITGEN] prolog word off=%x w=%x setup-s0\n",
+           func_sub_sp_offset + 12, read32le(cur_text_section->data + func_sub_sp_offset + 12));
     if( ( ind - func_sub_sp_offset ) != 5 * 4 )
         emit_NOP();
+    printf("[JITGEN] prolog word off=%x w=%x final used=%d\n",
+           func_sub_sp_offset + 16, read32le(cur_text_section->data + func_sub_sp_offset + 16),
+           ind - func_sub_sp_offset);
     ind = saved_ind;
 }
 
@@ -1180,9 +1327,11 @@ ST_FUNC void gsym_addr( int branch_list_offset, int target_offset )
             tcc_error( "out-of-range branch chain (> +-1MiB): %#03x", rel_jmp );
         }
         // generate the jmp table
-        if( rel_jmp == 4 ) {
+        if( rel_jmp == 0 || rel_jmp == 4 ) {
             // we just need a nop as PC will increment by 4 for us (this will need to be updated
             // once compressed instructions are added)
+            printf("[JITGEN] gsym nop off=%x target=%x rel=%d old=%x\n",
+                   ind, target_offset_uint, rel_jmp, next_branch_offset);
             emit_NOP();
         }
         else {
@@ -1209,6 +1358,11 @@ ST_FUNC int gjmp( int t )
 ST_FUNC void gjmp_addr( int a )
 {
     uint32_t rel_jmp = a - ind;
+    if( rel_jmp == 0 || rel_jmp == 4 ) {
+        printf("[JITGEN] gjmp_addr nop off=%x target=%x rel=%d\n", ind, a, rel_jmp);
+        emit_NOP();
+        return;
+    }
     // do we have a near jump or a far jump
     if( ( rel_jmp + ( 1 << 21 ) ) & ~( ( 1U << 22 ) - 2 ) ) {
         // far jump

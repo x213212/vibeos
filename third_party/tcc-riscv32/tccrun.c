@@ -66,6 +66,14 @@ static void rt_exit(int code);
 static void set_pages_executable(TCCState *s1, int mode, void *ptr, unsigned long length);
 static int tcc_relocate_ex(TCCState *s1, void *ptr, addr_t ptr_diff);
 
+static int tcc_run_section_ptr_valid(const Section *s)
+{
+    uintptr_t p = (uintptr_t)s;
+    if ((p & (sizeof(void *) - 1)) != 0)
+        return 0;
+    return p >= 0x80000000u && p < 0x88000000u;
+}
+
 #ifdef _WIN64
 static void *win64_add_function_table(TCCState *s1);
 static void win64_del_function_table(void *);
@@ -280,6 +288,11 @@ redo:
                 SHF_ALLOC|SHF_EXECINSTR, SHF_ALLOC, SHF_ALLOC|SHF_WRITE
                 };
             s = s1->sections[i];
+            if (!tcc_run_section_ptr_valid(s)) {
+                printf("[JITRUN] skip bad section i=%u ptr=%x nb=%d copy=%u k=%u\n",
+                       i, (unsigned)(uintptr_t)s, s1->nb_sections, copy, k);
+                continue;
+            }
             if (shf[k] != (s->sh_flags & (SHF_ALLOC|SHF_WRITE|SHF_EXECINSTR)))
                 continue;
             length = s->data_offset;
@@ -303,6 +316,7 @@ redo:
                     s->data = NULL;
                     s->data_allocated = 0;
                 }
+                s->sh_size = length;
                 s->data_offset = 0;
                 continue;
             }

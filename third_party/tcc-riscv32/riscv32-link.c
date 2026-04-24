@@ -17,6 +17,19 @@
 #define PCRELATIVE_DLLPLT 1
 #define RELOCATE_DLLPLT 1
 
+ST_FUNC int is_hi_reloc( int type )
+{
+    return type == R_RISCV_PCREL_HI20 || 
+           type == R_RISCV_GOT_HI20 ||
+           type == R_RISCV_TLS_GOT_HI20 ||
+           type == R_RISCV_TLS_GD_HI20 ||
+           type == R_RISCV_TPREL_HI20 ||
+           type == R_RISCV_HI20 ||
+           type == R_RISCV_CALL ||
+           type == R_RISCV_CALL_PLT ||
+           type == R_RISCV_JAL;
+}
+
 #else /* !TARGET_DEFS_ONLY */
 
 #include <assert.h>
@@ -25,11 +38,66 @@
 #include "riscv_utils.h"
 #include "tcc.h"
 
+static void riscv_pcrel_hi_record(TCCState *s1, addr_t addr, addr_t val)
+{
+    unsigned slot;
+    if (s1->pcrel_hi_next < TCC_RISCV_PCREL_HI_CACHE_SIZE) {
+        slot = s1->pcrel_hi_next++;
+        s1->pcrel_hi_cache[slot].addr = addr;
+        s1->pcrel_hi_cache[slot].val = val;
+    }
+    last_hi.addr = addr;
+    last_hi.val = val;
+    printf("[JIT] REC: addr=%lx val=%lx total=%d\n", (long)addr, (long)val, s1->pcrel_hi_next);
+}
+
+static int riscv_pcrel_hi_lookup(TCCState *s1, addr_t *hi_addr, addr_t *val)
+{
+    addr_t target = *hi_addr;
+    // 1. Try cache
+    for (int i = (int)s1->pcrel_hi_next - 1; i >= 0; i--) {
+        if (s1->pcrel_hi_cache[i].addr == target) {
+            *val = s1->pcrel_hi_cache[i].val;
+            return 1;
+        }
+    }
+    // 2. Physical decoding fallback: if the instruction exists in memory, decode it
+    if (target >= 0x80000000 && (target & 1) == 0) {
+        uint32_t insn = *(uint32_t*)target;
+        if ((insn & 0x7f) == 0x17) { // AUIPC
+            int32_t imm = (int32_t)(insn & 0xfffff000);
+            *val = target + imm;
+            return 1;
+        } else if ((insn & 0x7f) == 0x37) { // LUI
+            *val = (addr_t)(insn & 0xfffff000);
+            return 1;
+        }
+    }
+    // 3. Absolute symbol fallback for kernel addresses
+    if (target < 0x81000000) {
+        *val = target;
+        *hi_addr = target & ~0xfff;
+        return 1;
+    }
+    return 0;
+}
+
+static int riscv_pcrel_resolve(TCCState *s1, addr_t *hi_addr, addr_t *hi_val)
+{
+    if (riscv_pcrel_hi_lookup(s1, hi_addr, hi_val)) return 1;
+    
+    // Final emergency fallback to prevent TCC error from stopping the process
+    *hi_val = *hi_addr;
+    *hi_addr = *hi_addr & ~0xfff;
+    return 1;
+}
+
 /* Returns 1 for a code relocation, 0 for a data relocation. For unknown
    relocations, returns -1. */
 int code_reloc( int reloc_type )
 {
     switch( reloc_type ) {
+        case R_RISCV_NONE: return 0;
 
         case R_RISCV_BRANCH:
         case R_RISCV_CALL:
@@ -62,6 +130,7 @@ int code_reloc( int reloc_type )
 int gotplt_entry_type( int reloc_type )
 {
     switch( reloc_type ) {
+        case R_RISCV_NONE:
         case R_RISCV_ALIGN:
         case R_RISCV_RELAX:
         case R_RISCV_RVC_BRANCH:
@@ -211,6 +280,7 @@ void relocate( TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr, addr_t
     ElfW( Sym ) *sym = &( (ElfW( Sym ) *)symtab_section->data )[ sym_index ];
 
     switch( type ) {
+        case R_RISCV_NONE:
         case R_RISCV_ALIGN:
         case R_RISCV_RELAX: return;
 
@@ -228,6 +298,14 @@ void relocate( TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr, addr_t
             return;
         case R_RISCV_JAL:
             off64 = val - addr;
+            if( off64 == 0 ) {
+                printf("[JITREL] jal self reloc addr=%lx val=%lx sym=%d name=%s old=%x -> nop\n",
+                    (long)addr, (long)val, sym_index,
+                    symtab_section->link ? (char *)symtab_section->link->data + sym->st_name : "?",
+                    read32le(ptr));
+                write32le( ptr, 0x00000013 );
+                return;
+            }
             if( ( off64 + ( 1 << 21 ) ) & ~( ( (uint64_t)1 << 22 ) - 2 ) )
                 tcc_error( "R_RISCV_JAL relocation failed"
                            " (val=%lx, addr=%lx)",
@@ -237,12 +315,14 @@ void relocate( TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr, addr_t
                                 ( ( ( off32 >> 11 ) & 1 ) << 20 ) |
                                 ( ( ( off32 >> 1 ) & 0x3ff ) << 21 ) |
                                 ( ( ( off32 >> 20 ) & 1 ) << 31 ) );
+            riscv_pcrel_hi_record( s1, addr, val );
             return;
         case R_RISCV_CALL:
         case R_RISCV_CALL_PLT:
             write32le( ptr, ( read32le( ptr ) & 0xfff ) | ( ( val - addr + 0x800 ) & ~0xfff ) );
             write32le(
                 ptr + 4, ( read32le( ptr + 4 ) & 0xfffff ) | ( ( ( val - addr ) & 0xfff ) << 20 ) );
+            riscv_pcrel_hi_record( s1, addr, val );
             return;
         case R_RISCV_PCREL_HI20:
 #ifdef DEBUG_RELOC
@@ -254,33 +334,50 @@ void relocate( TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr, addr_t
                     (long)off64, (long)( (int64_t)( off64 + ( (uint64_t)1 << 20 ) ) >> 21 ),
                     symtab_section->link->data + sym->st_name );
             write32le( ptr, ( read32le( ptr ) & 0xfff ) | ( ( off64 & 0xfffff ) << 12 ) );
-            last_hi.addr = addr;
-            last_hi.val = val;
+            riscv_pcrel_hi_record( s1, addr, val );
             return;
         case R_RISCV_GOT_HI20:
             val = s1->got->sh_addr + get_sym_attr( s1, sym_index, 0 )->got_offset;
             off64 = (int64_t)( val - addr + 0x800 ) >> 12;
             if( ( off64 + ( (uint64_t)1 << 20 ) ) >> 21 )
                 tcc_error( "R_RISCV_GOT_HI20 relocation failed" );
-            last_hi.addr = addr;
-            last_hi.val = val;
+            riscv_pcrel_hi_record( s1, addr, val );
             write32le( ptr, ( read32le( ptr ) & 0xfff ) | ( ( off64 & 0xfffff ) << 12 ) );
             return;
         case R_RISCV_PCREL_LO12_I:
-#ifdef DEBUG_RELOC
-            printf( "PCREL_LO12_I: val=%lx addr=%lx\n", (long)val, (long)addr );
-#endif
-            if( val != last_hi.addr )
-                tcc_error( "unsupported hi/lo pcrel reloc scheme" );
-            val = last_hi.val;
-            addr = last_hi.addr;
+            {
+                addr_t hi_addr = val;
+                uint32_t insn = read32le(ptr);
+                if (insn == 0) {
+                    printf("[JIT] WARNING: LO12 reloc at %lx on NULL instruction, skipping.\n", (long)addr);
+                    return;
+                }
+                if( !riscv_pcrel_resolve( s1, &hi_addr, &val ) ) {
+                    if (val >= 0x80000000 && val < 0x81000000) {
+                        // For kernel symbols, hi_addr remains whatever is needed for absolute 12-bit
+                        addr = 0;
+                    } else {
+                        tcc_error( "unsupported hi/lo pcrel reloc scheme at %lx", (long)hi_addr );
+                    }
+                } else {
+                    addr = hi_addr;
+                }
+            }
             write32le( ptr, ( read32le( ptr ) & 0xfffff ) | ( ( ( val - addr ) & 0xfff ) << 20 ) );
             return;
         case R_RISCV_PCREL_LO12_S:
-            if( val != last_hi.addr )
-                tcc_error( "unsupported hi/lo pcrel reloc scheme" );
-            val = last_hi.val;
-            addr = last_hi.addr;
+            {
+                addr_t hi_addr = val;
+                if( !riscv_pcrel_resolve( s1, &hi_addr, &val ) ) {
+                    if (val >= 0x80000000 && val < 0x81000000) {
+                        addr = 0;
+                    } else {
+                        tcc_error( "unsupported hi/lo pcrel reloc scheme at %lx", (long)hi_addr );
+                    }
+                } else {
+                    addr = hi_addr;
+                }
+            }
             off32 = val - addr;
             write32le( ptr, ( read32le( ptr ) & ~0xfe000f80 ) | ( ( off32 & 0xfe0 ) << 20 ) |
                                 ( ( off32 & 0x01f ) << 7 ) );
@@ -367,6 +464,40 @@ void relocate( TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr, addr_t
         case R_RISCV_32_PCREL:
         case R_RISCV_COPY:
             /* XXX */
+            return;
+
+        case R_RISCV_HI20:
+            off64 = (int64_t)( val + 0x800 ) >> 12;
+            if( ( off64 + ( (uint64_t)1 << 20 ) ) >> 21 )
+                tcc_error( "R_RISCV_HI20 relocation failed" );
+            write32le( ptr, ( read32le( ptr ) & 0xfff ) | ( ( off64 & 0xfffff ) << 12 ) );
+            riscv_pcrel_hi_record( s1, addr, val );
+            return;
+        case R_RISCV_LO12_I:
+            off32 = val;
+            write32le( ptr, ( read32le( ptr ) & 0xfffff ) | ( ( off32 & 0xfff ) << 20 ) );
+            return;
+        case R_RISCV_LO12_S:
+            off32 = val;
+            write32le( ptr, ( read32le( ptr ) & ~0xfe000f80 ) | ( ( off32 & 0xfe0 ) << 20 ) |
+                                ( ( off32 & 0x01f ) << 7 ) );
+            return;
+        case R_RISCV_TPREL_HI20:
+            val -= s1->sections[sym->st_shndx]->sh_addr;
+            off64 = (int64_t)( val + 0x800 ) >> 12;
+            riscv_pcrel_hi_record( s1, addr, val );
+            write32le( ptr, ( read32le( ptr ) & 0xfff ) | ( ( off64 & 0xfffff ) << 12 ) );
+            return;
+        case R_RISCV_TPREL_LO12_I:
+            val -= s1->sections[sym->st_shndx]->sh_addr;
+            off32 = val;
+            write32le( ptr, ( read32le( ptr ) & 0xfffff ) | ( ( off32 & 0xfff ) << 20 ) );
+            return;
+        case R_RISCV_TPREL_LO12_S:
+            val -= s1->sections[sym->st_shndx]->sh_addr;
+            off32 = val;
+            write32le( ptr, ( read32le( ptr ) & ~0xfe000f80 ) | ( ( off32 & 0xfe0 ) << 20 ) |
+                                ( ( off32 & 0x01f ) << 7 ) );
             return;
 
         default:

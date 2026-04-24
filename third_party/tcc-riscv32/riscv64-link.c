@@ -17,16 +17,58 @@
 #define PCRELATIVE_DLLPLT 1
 #define RELOCATE_DLLPLT 1
 
+ST_FUNC int is_hi_reloc( int type )
+{
+    return type == R_RISCV_PCREL_HI20 || 
+           type == R_RISCV_GOT_HI20 ||
+           type == R_RISCV_TLS_GOT_HI20 ||
+           type == R_RISCV_TLS_GD_HI20 ||
+           type == R_RISCV_TPREL_HI20 ||
+           type == R_RISCV_HI20;
+}
+
 #else /* !TARGET_DEFS_ONLY */
 
 //#define DEBUG_RELOC
 #include "tcc.h"
+
+static void riscv_pcrel_hi_record(TCCState *s1, addr_t addr, addr_t val)
+{
+    unsigned slot;
+
+    last_hi.addr = addr;
+    last_hi.val = val;
+    if (s1->pcrel_hi_next >= TCC_RISCV_PCREL_HI_CACHE_SIZE)
+        tcc_error("too many HI20 relocations (limit=%d)", TCC_RISCV_PCREL_HI_CACHE_SIZE);
+    slot = s1->pcrel_hi_next++;
+    s1->pcrel_hi_cache[slot].addr = addr;
+    s1->pcrel_hi_cache[slot].val = val;
+}
+
+static int riscv_pcrel_hi_lookup(TCCState *s1, addr_t hi_addr, addr_t *val)
+{
+    if (hi_addr == last_hi.addr) {
+        *val = last_hi.val;
+        return 1;
+    }
+
+    for (unsigned i = 0; i < s1->pcrel_hi_next; ++i) {
+        if (s1->pcrel_hi_cache[i].addr != hi_addr)
+            continue;
+        *val = s1->pcrel_hi_cache[i].val;
+        return 1;
+    }
+
+    return 0;
+}
 
 /* Returns 1 for a code relocation, 0 for a data relocation. For unknown
    relocations, returns -1. */
 int code_reloc (int reloc_type)
 {
     switch (reloc_type) {
+    case R_RISCV_NONE:
+        return 0;
 
     case R_RISCV_BRANCH:
     case R_RISCV_CALL:
@@ -62,6 +104,7 @@ int code_reloc (int reloc_type)
 int gotplt_entry_type (int reloc_type)
 {
     switch (reloc_type) {
+    case R_RISCV_NONE:
     case R_RISCV_ALIGN:
     case R_RISCV_RELAX:
     case R_RISCV_RVC_BRANCH:
@@ -172,6 +215,7 @@ void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
     ElfW(Sym) *sym = &((ElfW(Sym) *)symtab_section->data)[sym_index];
 
     switch(type) {
+    case R_RISCV_NONE:
     case R_RISCV_ALIGN:
     case R_RISCV_RELAX:
         return;
@@ -218,16 +262,14 @@ void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
                     symtab_section->link->data + sym->st_name);
         write32le(ptr, (read32le(ptr) & 0xfff)
                        | ((off64 & 0xfffff) << 12));
-        last_hi.addr = addr;
-        last_hi.val = val;
+        riscv_pcrel_hi_record(s1, addr, val);
         return;
     case R_RISCV_GOT_HI20:
         val = s1->got->sh_addr + get_sym_attr(s1, sym_index, 0)->got_offset;
         off64 = (int64_t)(val - addr + 0x800) >> 12;
         if ((off64 + ((uint64_t)1 << 20)) >> 21)
           tcc_error("R_RISCV_GOT_HI20 relocation failed");
-        last_hi.addr = addr;
-        last_hi.val = val;
+        riscv_pcrel_hi_record(s1, addr, val);
         write32le(ptr, (read32le(ptr) & 0xfff)
                        | ((off64 & 0xfffff) << 12));
         return;
@@ -235,18 +277,22 @@ void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
 #ifdef DEBUG_RELOC
         printf("PCREL_LO12_I: val=%lx addr=%lx\n", (long)val, (long)addr);
 #endif
-        if (val != last_hi.addr)
-          tcc_error("unsupported hi/lo pcrel reloc scheme");
-        val = last_hi.val;
-        addr = last_hi.addr;
+        {
+            addr_t hi_addr = val;
+            if (!riscv_pcrel_hi_lookup(s1, hi_addr, &val))
+              tcc_error("unsupported hi/lo pcrel reloc scheme at %lx", (long)hi_addr);
+            addr = hi_addr;
+        }
         write32le(ptr, (read32le(ptr) & 0xfffff)
                        | (((val - addr) & 0xfff) << 20));
         return;
     case R_RISCV_PCREL_LO12_S:
-        if (val != last_hi.addr)
-          tcc_error("unsupported hi/lo pcrel reloc scheme");
-        val = last_hi.val;
-        addr = last_hi.addr;
+        {
+            addr_t hi_addr = val;
+            if (!riscv_pcrel_hi_lookup(s1, hi_addr, &val))
+              tcc_error("unsupported hi/lo pcrel reloc scheme at %lx", (long)hi_addr);
+            addr = hi_addr;
+        }
         off32 = val - addr;
         write32le(ptr, (read32le(ptr) & ~0xfe000f80)
                        | ((off32 & 0xfe0) << 20)

@@ -97,6 +97,9 @@ LIBTCCAPI int tcc_relocate(TCCState *s1, void *ptr);
    returns -1 if error. */
 #define TCC_RELOCATE_AUTO (void*)1
 
+/* return relocated executable section bounds, or -1 if unavailable */
+LIBTCCAPI int tcc_get_text_bounds(TCCState *s, unsigned long *lo, unsigned long *hi);
+
 /* return symbol value or NULL if not found */
 LIBTCCAPI void *tcc_get_symbol(TCCState *s, const char *name);
 

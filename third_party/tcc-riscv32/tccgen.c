@@ -44,6 +44,13 @@ static int nb_sym_pools;
 static Sym *all_cleanups, *pending_gotos;
 static int local_scope;
 static int in_sizeof;
+struct func_return_epilog_site {
+    int jmp;
+    int dwarf_file;
+    int line;
+};
+static struct func_return_epilog_site **func_return_epilog_sites;
+static int nb_func_return_epilog_sites;
 ST_DATA char debug_modes;
 
 ST_DATA SValue *vtop;
@@ -99,6 +106,19 @@ static struct temp_local_variable {
 	short align;
 } arr_temp_local_vars[MAX_TEMP_LOCAL_VARIABLE_NUMBER];
 static int nb_temp_local_vars;
+
+static void func_return_epilog_add(int jmp, int dwarf_file, int line)
+{
+    struct func_return_epilog_site *site;
+
+    if (!jmp)
+        return;
+    site = tcc_mallocz(sizeof(*site));
+    site->jmp = jmp;
+    site->dwarf_file = dwarf_file;
+    site->line = line;
+    dynarray_add(&func_return_epilog_sites, &nb_func_return_epilog_sites, site);
+}
 
 static struct scope {
     struct scope *prev;
@@ -6874,6 +6894,12 @@ again:
             check_func_return();
 
     } else if (t == TOK_RETURN) {
+        int debug_return_file = 0;
+        int debug_return_line = 0;
+        if (debug_modes)
+            tcc_debug_line(tcc_state);
+        if (debug_modes)
+            tcc_debug_get_location(tcc_state, &debug_return_file, &debug_return_line);
         b = (func_vt.t & VT_BTYPE) != VT_VOID;
         if (tok != ';') {
             gexpr();
@@ -6891,10 +6917,16 @@ again:
         leave_scope(root_scope);
         if (b)
             gfunc_return(&func_vt);
+        if (!debug_modes)
+            tcc_debug_epilogue_begin(tcc_state);
         skip(';');
-        /* jump unless last stmt in top-level block */
-        if (tok != '}' || local_scope != 1)
+        if (debug_modes) {
+            int ret_jmp = gjmp(0);
+            func_return_epilog_add(ret_jmp, debug_return_file, debug_return_line);
+        } else if (tok != '}' || local_scope != 1) {
+            /* jump unless last stmt in top-level block */
             rsym = gjmp(rsym);
+        }
         if (debug_modes)
 	    tcc_tcov_block_end (tcc_state, -1);
         CODE_OFF();
@@ -8160,6 +8192,7 @@ static void gen_function(Sym *sym)
     func_ind = ind;
     func_vt = sym->type.ref->type;
     func_var = sym->type.ref->f.func_type == FUNC_ELLIPSIS;
+    dynarray_reset(&func_return_epilog_sites, &nb_func_return_epilog_sites);
 
     /* put debug symbol */
     tcc_debug_funcstart(tcc_state, sym);
@@ -8167,16 +8200,29 @@ static void gen_function(Sym *sym)
     sym_push2(&local_stack, SYM_FIELD, 0, 0);
     local_scope = 1; /* for function parameters */
     gfunc_prolog(sym);
+    tcc_debug_prologue_end(tcc_state);
     local_scope = 0;
     rsym = 0;
     clear_temp_local_var_list();
     func_vla_arg(sym);
     block(0);
-    gsym(rsym);
     nocode_wanted = 0;
     /* reset local stack */
     pop_local_syms(NULL, 0);
+    if (debug_modes) {
+        int i;
+        for (i = 0; i < nb_func_return_epilog_sites; ++i) {
+            struct func_return_epilog_site *site = func_return_epilog_sites[i];
+            gsym(site->jmp);
+            tcc_debug_epilogue_begin_at(tcc_state, site->dwarf_file, site->line);
+            gfunc_epilog();
+            tcc_free(site);
+        }
+    } else {
+        gsym(rsym);
+    }
     gfunc_epilog();
+    dynarray_reset(&func_return_epilog_sites, &nb_func_return_epilog_sites);
     cur_text_section->data_offset = ind;
     local_scope = 0;
     label_pop(&global_label_stack, NULL, 0);

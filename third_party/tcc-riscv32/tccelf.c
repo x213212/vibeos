@@ -23,6 +23,8 @@
 /* Define this to get some debug output during relocation processing.  */
 #undef DEBUG_RELOC
 
+static int tcc_section_ptr_valid(const Section *s);
+
 /********************************************************/
 /* global variables */
 
@@ -115,8 +117,14 @@ ST_FUNC void tccelf_delete(TCCState *s1)
 #endif
 
     /* free all sections */
-    for(i = 1; i < s1->nb_sections; i++)
+    for(i = 1; i < s1->nb_sections; i++) {
+        if (!tcc_section_ptr_valid(s1->sections[i])) {
+            printf("[JITSEC] skip free bad section i=%d ptr=%x nb=%d\n",
+                   i, (unsigned)(uintptr_t)s1->sections[i], s1->nb_sections);
+            continue;
+        }
         free_section(s1->sections[i]);
+    }
     dynarray_reset(&s1->sections, &s1->nb_sections);
 
     for(i = 0; i < s1->nb_priv_sections; i++)
@@ -1109,74 +1117,115 @@ ST_FUNC void relocate_syms(TCCState *s1, Section *symtab, int do_resolve)
     }
 }
 
+static int tcc_section_ptr_valid(const Section *s)
+{
+    uintptr_t p = (uintptr_t)s;
+    if ((p & (sizeof(void *) - 1)) != 0)
+        return 0;
+    return p >= 0x80000000u && p < 0x88000000u;
+}
+
 /* relocate a given section (CPU dependent) by applying the relocations
    in the associated relocation section */
-static void relocate_section(TCCState *s1, Section *s, Section *sr)
+static void relocate_section(TCCState *s1, Section *s, Section *sr, int pass)
 {
     ElfW_Rel *rel;
     ElfW(Sym) *sym;
+    Section *sym_sec;
     int type, sym_index;
     unsigned char *ptr;
     addr_t tgt, addr;
     int is_dwarf = s->sh_num >= s1->dwlo && s->sh_num < s1->dwhi;
 
-    qrel = (ElfW_Rel *)sr->data;
+    printf("[JITSEC] relsec pass=%d s=%x #%d type=%x flags=%x data=%x size=%lu sr=%x #%d info=%d data=%x size=%lu\n",
+           pass, (unsigned)(uintptr_t)s, s ? s->sh_num : -1,
+           s ? s->sh_type : -1, s ? s->sh_flags : 0,
+           s ? (unsigned)(uintptr_t)s->data : 0, s ? (unsigned long)s->data_offset : 0,
+           (unsigned)(uintptr_t)sr, sr ? sr->sh_num : -1, sr ? sr->sh_info : -1,
+           sr ? (unsigned)(uintptr_t)sr->data : 0, sr ? (unsigned long)sr->data_offset : 0);
     for_each_elem(sr, 0, rel, ElfW_Rel) {
+        type = ELFW(R_TYPE)(rel->r_info);
+        if (pass == 0 && !is_hi_reloc(type))
+            continue;
+        if (pass == 1 && is_hi_reloc(type))
+            continue;
+
         ptr = s->data + rel->r_offset;
         sym_index = ELFW(R_SYM)(rel->r_info);
         sym = &((ElfW(Sym) *)symtab_section->data)[sym_index];
-        type = ELFW(R_TYPE)(rel->r_info);
         tgt = sym->st_value;
 #if SHT_RELX == SHT_RELA
         tgt += rel->r_addend;
 #endif
-        if (is_dwarf && type == R_DATA_32DW
+        if (pass == 1 && is_dwarf && type == R_DATA_32DW
             && sym->st_shndx >= s1->dwlo && sym->st_shndx < s1->dwhi) {
             /* dwarf section relocation to each other */
-            add32le(ptr, tgt - s1->sections[sym->st_shndx]->sh_addr);
+            sym_sec = (sym->st_shndx >= 0 && sym->st_shndx < s1->nb_sections)
+                          ? s1->sections[sym->st_shndx]
+                          : NULL;
+            printf("[JITSEC] dwarf32 pass=%d sec=%d rel_off=%lx type=%d sym=%d shndx=%d tgt=%lx sym_sec=%x valid=%d\n",
+                   pass, s ? s->sh_num : -1, (unsigned long)rel->r_offset, type,
+                   sym_index, sym->st_shndx, (unsigned long)tgt,
+                   (unsigned)(uintptr_t)sym_sec,
+                   tcc_section_ptr_valid(sym_sec));
+            if (!tcc_section_ptr_valid(sym_sec)) {
+                printf("[JITSEC] skip dwarf32 bad sym section shndx=%d ptr=%x\n",
+                       sym->st_shndx, (unsigned)(uintptr_t)sym_sec);
+                continue;
+            }
+            add32le(ptr, tgt - sym_sec->sh_addr);
             continue;
         }
         addr = s->sh_addr + rel->r_offset;
         relocate(s1, rel, type, ptr, addr, tgt);
     }
-#ifndef ELF_OBJ_ONLY
-    /* if the relocation is allocated, we change its symbol table */
-    if (sr->sh_flags & SHF_ALLOC) {
-        sr->link = s1->dynsym;
-        if (s1->output_type & TCC_OUTPUT_DYN) {
-            size_t r = (uint8_t*)qrel - sr->data;
-            if (sizeof ((Stab_Sym*)0)->n_value < PTR_SIZE
-                && 0 == strcmp(s->name, ".stab"))
-                r = 0; /* cannot apply 64bit relocation to 32bit value */
-            sr->data_offset = sr->sh_size = r;
-#ifdef CONFIG_TCC_PIE
-            if (r && 0 == (s->sh_flags & SHF_WRITE))
-                tcc_warning("%d relocations to ro-section %s", (unsigned)(r / sizeof *qrel), s->name);
-#endif
-        }
-    }
-#endif
 }
 
 /* relocate all sections */
 ST_FUNC void relocate_sections(TCCState *s1)
 {
-    int i;
+    int i, pass;
     Section *s, *sr;
+
+#if defined TCC_TARGET_RISCV64 || defined TCC_TARGET_RISCV32
+    s1->pcrel_hi_next = 0;
+#endif
+
+    for (pass = 0; pass < 2; pass++) {
+        for (i = 1; i < s1->nb_sections; ++i) {
+            sr = s1->sections[i];
+            if (!tcc_section_ptr_valid(sr))
+                continue;
+            if (sr->sh_type != SHT_RELX)
+                continue;
+            if (sr->sh_info <= 0 || sr->sh_info >= s1->nb_sections)
+                continue;
+            s = s1->sections[sr->sh_info];
+            if (!tcc_section_ptr_valid(s))
+                continue;
+#ifndef TCC_TARGET_MACHO
+            if (s != s1->got
+                || s1->static_link
+                || s1->output_type == TCC_OUTPUT_MEMORY)
+#endif
+            {
+                relocate_section(s1, s, sr, pass);
+            }
+        }
+    }
 
     for (i = 1; i < s1->nb_sections; ++i) {
         sr = s1->sections[i];
+        if (!tcc_section_ptr_valid(sr))
+            continue;
         if (sr->sh_type != SHT_RELX)
             continue;
+        if (sr->sh_info <= 0 || sr->sh_info >= s1->nb_sections)
+            continue;
         s = s1->sections[sr->sh_info];
-#ifndef TCC_TARGET_MACHO
-        if (s != s1->got
-            || s1->static_link
-            || s1->output_type == TCC_OUTPUT_MEMORY)
-#endif
-        {
-            relocate_section(s1, s, sr);
-        }
+        if (!tcc_section_ptr_valid(s))
+            continue;
+        qrel = (ElfW_Rel *)((uint8_t*)sr->data + sr->data_offset);
 #ifndef ELF_OBJ_ONLY
         if (sr->sh_flags & SHF_ALLOC) {
             ElfW_Rel *rel;
@@ -1384,11 +1433,17 @@ ST_FUNC void build_got_entries(TCCState *s1, int got_sym)
     int pass = 0;
 redo:
     for(i = 1; i < s1->nb_sections; i++) {
+        Section *target_sec;
         s = s1->sections[i];
         if (s->sh_type != SHT_RELX)
             continue;
         /* no need to handle got relocations */
         if (s->link != symtab_section)
+            continue;
+        if (s->sh_info <= 0 || s->sh_info >= s1->nb_sections)
+            continue;
+        target_sec = s1->sections[s->sh_info];
+        if (!target_sec || !(target_sec->sh_flags & SHF_ALLOC))
             continue;
         for_each_elem(s, 0, rel, ElfW_Rel) {
             type = ELFW(R_TYPE)(rel->r_info);
@@ -3295,6 +3350,7 @@ ST_FUNC int tcc_load_object_file(TCCState *s1,
 #ifdef TCC_TARGET_ARM
                     && type != R_ARM_V4BX
 #elif defined TCC_TARGET_RISCV64 || defined TCC_TARGET_RISCV32
+                    && type != R_RISCV_NONE
                     && type != R_RISCV_ALIGN
                     && type != R_RISCV_RELAX
 #endif

@@ -967,7 +967,10 @@ struct TCCState {
     #define qrel s1->qrel
 
 #if defined TCC_TARGET_RISCV64 || defined TCC_TARGET_RISCV32
+    #define TCC_RISCV_PCREL_HI_CACHE_SIZE 8192
     struct pcrel_hi { addr_t addr, val; } last_hi;
+    struct pcrel_hi pcrel_hi_cache[TCC_RISCV_PCREL_HI_CACHE_SIZE];
+    unsigned pcrel_hi_next;
     #define last_hi s1->last_hi
 #endif
 
@@ -1604,6 +1607,7 @@ ST_FUNC void build_got_entries(TCCState *s1, int got_sym); /* in tccelf.c */
 #endif
 
 ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr, addr_t addr, addr_t val);
+ST_FUNC int is_hi_reloc(int type);
 
 /* ------------ xxx-gen.c ------------ */
 ST_DATA const char * const target_machine_defs;
@@ -1813,6 +1817,10 @@ ST_FUNC void tcc_debug_eincl(TCCState *s1);
 ST_FUNC void tcc_debug_putfile(TCCState *s1, const char *filename);
 
 ST_FUNC void tcc_debug_line(TCCState *s1);
+ST_FUNC void tcc_debug_get_location(TCCState *s1, int *dwarf_file, int *line);
+ST_FUNC void tcc_debug_prologue_end(TCCState *s1);
+ST_FUNC void tcc_debug_epilogue_begin(TCCState *s1);
+ST_FUNC void tcc_debug_epilogue_begin_at(TCCState *s1, int dwarf_file, int line);
 ST_FUNC void tcc_add_debug_info(TCCState *s1, int param, Sym *s, Sym *e);
 ST_FUNC void tcc_debug_funcstart(TCCState *s1, Sym *sym);
 ST_FUNC void tcc_debug_funcend(TCCState *s1, int size);

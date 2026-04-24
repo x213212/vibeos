@@ -17,6 +17,11 @@
 #define PCRELATIVE_DLLPLT 1
 #define RELOCATE_DLLPLT 1
 
+ST_FUNC int is_hi_reloc( int type )
+{
+    return 0;
+}
+
 #else /* !TARGET_DEFS_ONLY */
 
 #include "tcc.h"

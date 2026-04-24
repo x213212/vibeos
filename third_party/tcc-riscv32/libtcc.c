@@ -77,6 +77,57 @@ TCC_SEM(static tcc_compile_sem);
 static int nb_states;
 #endif
 
+static int tcc_public_section_ptr_valid(const Section *s)
+{
+    uintptr_t p = (uintptr_t)s;
+    if ((p & (sizeof(void *) - 1)) != 0)
+        return 0;
+    return p >= 0x80000000u && p < 0x88000000u;
+}
+
+LIBTCCAPI int tcc_get_text_bounds(TCCState *s, unsigned long *lo, unsigned long *hi)
+{
+    unsigned long best_lo = 0;
+    unsigned long best_hi = 0;
+
+    if (!s || !lo || !hi)
+        return -1;
+
+    for (int i = 1; i < s->nb_sections; i++) {
+        Section *sec = s->sections[i];
+        unsigned long start;
+        unsigned long end;
+
+        if (!tcc_public_section_ptr_valid(sec)) {
+            printf("[JITBOUNDS] skip bad section i=%d ptr=%x nb=%d\n",
+                   i, (unsigned)(uintptr_t)sec, s->nb_sections);
+            continue;
+        }
+        if ((sec->sh_flags & (SHF_ALLOC | SHF_EXECINSTR)) != (SHF_ALLOC | SHF_EXECINSTR))
+            continue;
+        unsigned long size = sec->data_offset ? sec->data_offset : sec->sh_size;
+        if (!sec->sh_addr || !size)
+            continue;
+
+        start = (unsigned long)sec->sh_addr;
+        end = start + size;
+        if (end <= start)
+            continue;
+
+        if (!best_lo || start < best_lo)
+            best_lo = start;
+        if (end > best_hi)
+            best_hi = end;
+    }
+
+    if (!best_lo || best_hi <= best_lo)
+        return -1;
+
+    *lo = best_lo;
+    *hi = best_hi;
+    return 0;
+}
+
 /********************************************************/
 #ifdef _WIN32
 ST_FUNC char *normalize_slashes(char *path)

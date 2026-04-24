@@ -20,6 +20,9 @@
 
 #include "tcc.h"
 
+#define TCC_DWARF_LINE_PROLOGUE_END   1
+#define TCC_DWARF_LINE_EPILOGUE_BEGIN 2
+
 /* stab debug support */
 
 static const struct {
@@ -345,6 +348,7 @@ struct _tccdbg {
         int last_file;
         int last_pc;
         int last_line;
+        int pending_flags;
     } dwarf_line;
 
     struct {
@@ -652,6 +656,82 @@ static void dwarf_sleb128_op (TCCState *s1, long long value)
     } while (more);
 }
 
+static void dwarf_line_apply_flags(TCCState *s1, int flags)
+{
+    if (flags & TCC_DWARF_LINE_PROLOGUE_END)
+        dwarf_line_op(s1, DW_LNS_set_prologue_end);
+    if (flags & TCC_DWARF_LINE_EPILOGUE_BEGIN)
+        dwarf_line_op(s1, DW_LNS_set_epilogue_begin);
+}
+
+static void dwarf_line_emit_row(TCCState *s1, BufferedFile *f, int extra_flags, int force_row)
+{
+    int len_pc, len_line, n;
+    int file_changed = 0;
+    int flags = dwarf_line.pending_flags | extra_flags;
+
+    if (dwarf_line.cur_file != dwarf_line.last_file) {
+        dwarf_line.last_file = dwarf_line.cur_file;
+        dwarf_line_op(s1, DW_LNS_set_file);
+        dwarf_uleb128_op(s1, dwarf_line.cur_file);
+        file_changed = 1;
+    }
+
+    len_pc = (ind - dwarf_line.last_pc) / DWARF_MIN_INSTR_LEN;
+    len_line = f->line_num - dwarf_line.last_line;
+    n = len_pc * DWARF_LINE_RANGE + len_line + DWARF_OPCODE_BASE - DWARF_LINE_BASE;
+
+    if (len_pc &&
+        len_line >= DWARF_LINE_BASE && len_line <= (DWARF_OPCODE_BASE + DWARF_LINE_BASE) &&
+        n >= DWARF_OPCODE_BASE && n <= 255) {
+        dwarf_line_apply_flags(s1, flags);
+        dwarf_line_op(s1, n);
+    } else {
+        if (len_pc) {
+            dwarf_line_op(s1, DW_LNS_advance_pc);
+            dwarf_uleb128_op(s1, len_pc);
+        }
+        if (len_line) {
+            dwarf_line_op(s1, DW_LNS_advance_line);
+            dwarf_sleb128_op(s1, len_line);
+        }
+        if (file_changed || flags || force_row || len_pc || len_line) {
+            dwarf_line_apply_flags(s1, flags);
+            dwarf_line_op(s1, DW_LNS_copy);
+        }
+    }
+
+    dwarf_line.pending_flags = 0;
+    dwarf_line.last_pc = ind;
+    dwarf_line.last_line = f->line_num;
+}
+
+static BufferedFile *put_new_file(TCCState *s1);
+
+ST_FUNC void tcc_debug_get_location(TCCState *s1, int *dwarf_file_index, int *line)
+{
+    BufferedFile *f;
+
+    if (dwarf_file_index)
+        *dwarf_file_index = 0;
+    if (line)
+        *line = 0;
+    if (!s1->do_debug)
+        return;
+    if (cur_text_section != text_section)
+        return;
+    f = put_new_file(s1);
+    if (!f)
+        return;
+    if (line)
+        *line = f->line_num;
+    if (s1->dwarf) {
+        dwarf_file(s1);
+        if (dwarf_file_index)
+            *dwarf_file_index = dwarf_line.cur_file;
+    }
+}
+
 /* start of translation unit info */
 ST_FUNC void tcc_debug_start(TCCState *s1)
 {
@@ -806,6 +886,7 @@ ST_FUNC void tcc_debug_start(TCCState *s1)
             dwarf_line.last_file = 0;
             dwarf_line.last_pc = 0;
             dwarf_line.last_line = 1;
+            dwarf_line.pending_flags = 0;
             dwarf_line_op(s1, 0); // extended
             dwarf_uleb128_op(s1, 1 + PTR_SIZE); // extended size
             dwarf_line_op(s1, DW_LNE_set_address);
@@ -1072,6 +1153,7 @@ ST_FUNC void tcc_debug_eincl(TCCState *s1)
 ST_FUNC void tcc_debug_line(TCCState *s1)
 {
     BufferedFile *f;
+    int pending_flags = 0;
 
     if (!s1->do_debug)
         return;
@@ -1080,47 +1162,14 @@ ST_FUNC void tcc_debug_line(TCCState *s1)
     f = put_new_file(s1);
     if (!f)
         return;
-    if (last_line_num == f->line_num)
+    if (s1->dwarf)
+        pending_flags = dwarf_line.pending_flags;
+    if (last_line_num == f->line_num && !pending_flags)
         return;
     last_line_num = f->line_num;
 
     if (s1->dwarf) {
-	int len_pc = (ind - dwarf_line.last_pc) / DWARF_MIN_INSTR_LEN;
-	int len_line = f->line_num - dwarf_line.last_line;
-	int n = len_pc * DWARF_LINE_RANGE + len_line + DWARF_OPCODE_BASE - DWARF_LINE_BASE;
-
-	if (dwarf_line.cur_file != dwarf_line.last_file) {
-	    dwarf_line.last_file = dwarf_line.cur_file;
-	    dwarf_line_op(s1, DW_LNS_set_file);
-	    dwarf_uleb128_op(s1, dwarf_line.cur_file);
-	}
-	if (len_pc &&
-	    len_line >= DWARF_LINE_BASE && len_line <= (DWARF_OPCODE_BASE + DWARF_LINE_BASE) &&
-	    n >= DWARF_OPCODE_BASE && n <= 255)
-            dwarf_line_op(s1, n);
-	else {
-	    if (len_pc) {
-	        n = len_pc * DWARF_LINE_RANGE + 0 + DWARF_OPCODE_BASE - DWARF_LINE_BASE;
-	        if (n >= DWARF_OPCODE_BASE && n <= 255)
-                    dwarf_line_op(s1, n);
-		else {
-	            dwarf_line_op(s1, DW_LNS_advance_pc);
-		    dwarf_uleb128_op(s1, len_pc);
-		}
-	    }
-	    if (len_line) {
-	        n = 0 * DWARF_LINE_RANGE + len_line + DWARF_OPCODE_BASE - DWARF_LINE_BASE;
-	        if (len_line >= DWARF_LINE_BASE && len_line <= (DWARF_OPCODE_BASE + DWARF_LINE_BASE) &&
-		    n >= DWARF_OPCODE_BASE && n <= 255)
-	            dwarf_line_op(s1, n);
-		else {
-	            dwarf_line_op(s1, DW_LNS_advance_line);
-		    dwarf_sleb128_op(s1, len_line);
-		}
-	    }
-	}
-	dwarf_line.last_pc = ind;
-	dwarf_line.last_line = f->line_num;
+        dwarf_line_emit_row(s1, f, 0, 0);
     }
     else
     {
@@ -1131,6 +1180,53 @@ ST_FUNC void tcc_debug_line(TCCState *s1)
             put_stabs_r(s1, NULL, N_SLINE, 0, f->line_num, ind, text_section, section_sym);
         }
     }
+}
+
+ST_FUNC void tcc_debug_prologue_end(TCCState *s1)
+{
+    if (!s1->do_debug || !s1->dwarf)
+        return;
+    if (cur_text_section != text_section)
+        return;
+    dwarf_line.pending_flags |= TCC_DWARF_LINE_PROLOGUE_END;
+}
+
+ST_FUNC void tcc_debug_epilogue_begin_at(TCCState *s1, int dwarf_file_index, int line)
+{
+    BufferedFile fake = { 0 };
+    int saved_cur_file;
+
+    if (!s1->do_debug)
+        return;
+    if (cur_text_section != text_section)
+        return;
+    if (line < 0)
+        line = 0;
+
+    if (s1->dwarf) {
+        saved_cur_file = dwarf_line.cur_file;
+        if (dwarf_file_index > 0)
+            dwarf_line.cur_file = dwarf_file_index;
+        fake.line_num = line;
+        last_line_num = line;
+        dwarf_line_emit_row(s1, &fake, TCC_DWARF_LINE_EPILOGUE_BEGIN, 1);
+        dwarf_line.cur_file = saved_cur_file;
+    } else {
+        last_line_num = line;
+        if (func_ind != -1)
+            put_stabn(s1, N_SLINE, 0, line, ind - func_ind);
+        else
+            put_stabs_r(s1, NULL, N_SLINE, 0, line, ind, text_section, section_sym);
+    }
+}
+
+ST_FUNC void tcc_debug_epilogue_begin(TCCState *s1)
+{
+    int dwarf_file_index = 0;
+    int line = 0;
+
+    tcc_debug_get_location(s1, &dwarf_file_index, &line);
+    tcc_debug_epilogue_begin_at(s1, dwarf_file_index, line);
 }
 
 static void tcc_debug_stabs (TCCState *s1, const char *str, int type, unsigned long value,
@@ -1787,8 +1883,7 @@ ST_FUNC void tcc_debug_funcstart(TCCState *s1, Sym *sym)
 	return;
 
     if (s1->dwarf) {
-        tcc_debug_line(s1);
-	dwarf_line_op(s1, DW_LNS_copy);
+        dwarf_line.pending_flags = 0;
         dwarf_info.func = sym;
         dwarf_info.line = file->line_num;
 	if (s1->do_backtrace) {
