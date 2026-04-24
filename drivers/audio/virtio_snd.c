@@ -67,7 +67,6 @@ static void snd_queue_setup(int qid) {
     *R_SND(VIRTIO_MMIO_QUEUE_NUM) = q->num;
     *R_SND(VIRTIO_MMIO_QUEUE_ALIGN) = PGSIZE;
     *R_SND(VIRTIO_MMIO_QUEUE_PFN) = ((uint32)(uintptr_t)q->pages) / PGSIZE;
-    *R_SND(VIRTIO_MMIO_QUEUE_READY) = 1;
 }
 
 static int snd_wait_queue_used(int qid, uint16_t used_idx_before) {

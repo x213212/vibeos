@@ -1,4 +1,5 @@
 CC = riscv64-unknown-elf-gcc
+RISCV_ARCH ?= rv32ima
 THIRD_PARTY_DIR = ./third_party
 MBEDTLS_DIR = $(THIRD_PARTY_DIR)/mbedtls
 MBEDTLS_BUILD_DIR = /tmp/mbedtls-rv-build
@@ -17,7 +18,7 @@ LWIP_DIR = $(THIRD_PARTY_DIR)/lwip
 GBEMU_DIR = $(THIRD_PARTY_DIR)/gbemu
 WRP_DIR = $(THIRD_PARTY_DIR)/wrp
 
-CFLAGS = -nostdlib -fno-builtin -mcmodel=medany -march=rv32imac -mabi=ilp32 -DLWIP_NO_CTYPE_H -DWITHOUT_ICONV_FILTER -g -Wall -w \
+CFLAGS = -nostdlib -fno-builtin -mcmodel=medany -march=$(RISCV_ARCH) -mabi=ilp32 -DLWIP_NO_CTYPE_H -DWITHOUT_ICONV_FILTER -g -Wall -w \
          -mno-relax \
          -I./ -I./runtime/jit -I./ports/mbedtls -I$(LWIP_DIR)/src/include -I$(LWIP_DIR)/src/core -I$(LWIP_DIR)/src/netif \
          -I./apps/gbemu -I./apps/netsurf -I./apps/net/wget -I./apps/ssh -I./drivers/audio \
@@ -147,7 +148,18 @@ THIRD_PARTY_SOURCES = $(GBEMU_CORE_SOURCES) \
 OBJ = $(CORE_SOURCES) $(USER_SOURCES) $(APP_SOURCES) $(DRIVER_SOURCES) $(THIRD_PARTY_SOURCES)
 
 QEMU = qemu-system-riscv32
-QEMU_DISPLAY ?= :0
+HOST_DISPLAY := $(DISPLAY)
+SSH_CLIENT_IP := $(word 1,$(SSH_CONNECTION))
+QEMU_DISPLAY ?= $(if $(strip $(HOST_DISPLAY)),$(HOST_DISPLAY),$(if $(strip $(SSH_CLIENT_IP)),$(SSH_CLIENT_IP):0.0,:0))
+QEMU_DISPLAY_BACKEND ?= gtk
+QEMU_GUEST_ERRORS ?= 0
+ifeq ($(QEMU_GUEST_ERRORS),1)
+QEMU_LOG_FLAGS = -d guest_errors
+endif
+QEMU_RUN_ENV =
+ifneq ($(strip $(QEMU_DISPLAY)),)
+QEMU_RUN_ENV += DISPLAY=$(QEMU_DISPLAY)
+endif
 QFLAGS = -smp 1 -machine virt -m 1G -bios none \
          -drive if=none,format=raw,file=hdd.dsk,id=x0 \
          -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 \
@@ -155,7 +167,8 @@ QFLAGS = -smp 1 -machine virt -m 1G -bios none \
          -device virtio-keyboard-device,bus=virtio-mmio-bus.2 \
          -device virtio-tablet-device,bus=virtio-mmio-bus.3 \
          -netdev tap,id=net0,ifname=tap0,script=no,downscript=no \
-         -d guest_errors \
+         $(QEMU_LOG_FLAGS) \
+         -display $(QEMU_DISPLAY_BACKEND) \
          -device VGA \
          -monitor telnet:localhost:4321,server,nowait
 
@@ -165,6 +178,7 @@ ifeq ($(ENABLE_AUDIO),1)
 QEMU_AUDIO_FLAGS = -audiodev pa,id=snd0,server=unix:$(PULSE_SERVER_PATH) -device AC97,audiodev=snd0
 endif
 
+ENABLE_HDD_BACKUP ?= 0
 HDD_BACKUP_DIR ?= hdd_backups
 HDD_BACKUP_KEEP ?= 10
 
@@ -191,18 +205,29 @@ $(BUILD_DIR)/%.o: %.s
 
 -include $(DEPS)
 
-qemu: os.elf hdd.dsk backup-hdd
+QEMU_DEPS = os.elf hdd.dsk
+ifeq ($(ENABLE_HDD_BACKUP),1)
+QEMU_DEPS += backup-hdd
+endif
+
+qemu: $(QEMU_DEPS)
 	@if [ "$(ENABLE_AUDIO)" = "1" ]; then \
 		if [ -S "$(PULSE_SERVER_PATH)" ]; then \
 			echo "QEMU audio: PulseAudio socket found at $(PULSE_SERVER_PATH)"; \
-			DISPLAY=$(QEMU_DISPLAY) PULSE_SERVER=unix:$(PULSE_SERVER_PATH) $(QEMU) $(QFLAGS) $(QEMU_AUDIO_FLAGS) -kernel os.elf; \
+			$(QEMU_RUN_ENV) PULSE_SERVER=unix:$(PULSE_SERVER_PATH) $(QEMU) $(QFLAGS) $(QEMU_AUDIO_FLAGS) -kernel os.elf; \
 		else \
 			echo "QEMU audio: PulseAudio socket not found at $(PULSE_SERVER_PATH), falling back to no audio."; \
-			DISPLAY=$(QEMU_DISPLAY) $(QEMU) $(QFLAGS) -kernel os.elf; \
+			$(QEMU_RUN_ENV) $(QEMU) $(QFLAGS) -kernel os.elf; \
 		fi; \
 	else \
-		DISPLAY=$(QEMU_DISPLAY) $(QEMU) $(QFLAGS) -kernel os.elf; \
+		$(QEMU_RUN_ENV) $(QEMU) $(QFLAGS) -kernel os.elf; \
 	fi
+
+qemu-backup: ENABLE_HDD_BACKUP = 1
+qemu-backup: qemu
+
+qemu-sdl: QEMU_DISPLAY_BACKEND = sdl
+qemu-sdl: qemu
 
 backup-hdd: hdd.dsk
 	@mkdir -p $(HDD_BACKUP_DIR)

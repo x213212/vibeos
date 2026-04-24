@@ -26,7 +26,6 @@ void virtio_disk_init() {
   *R(VIRTIO_MMIO_QUEUE_ALIGN) = PGSIZE;
   memset(disk.pages, 0, sizeof(disk.pages));
   *R(VIRTIO_MMIO_QUEUE_PFN) = ((uint32)disk.pages) / PGSIZE;
-  *R(VIRTIO_MMIO_QUEUE_READY) = 1;
   disk.desc = (virtq_desc_t *)disk.pages;
   disk.avail = (virtq_avail_t *)(disk.pages + NUM * sizeof(virtq_desc_t));
   disk.used = (virtq_used_t *)(disk.pages + PGSIZE);

@@ -797,6 +797,12 @@ static void exec_single_cmd_legacy(struct Window *w, char *cmd) {
                 lib_strcpy(out, "ERR: Dir Not Found.");
                 return;
             }
+            if (leaf[0] == '\0' || strcmp(leaf, ".") == 0) {
+                w->cwd_bno = parent_bno ? parent_bno : 1;
+                lib_strcpy(w->cwd, parent_cwd[0] ? parent_cwd : "/root");
+                terminal_env_sync_pwd(w);
+                return;
+            }
             memset(tmp, 0, sizeof(*tmp));
             tmp->cwd_bno = parent_bno ? parent_bno : 1;
             lib_strcpy(tmp->cwd, parent_cwd[0] ? parent_cwd : "/root");
@@ -1697,4 +1703,3 @@ void exec_single_cmd(struct Window *w, char *cmd) {
     }
     exec_single_cmd_legacy(w, cmd);
 }
-

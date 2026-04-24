@@ -62,7 +62,7 @@ Compile mbedTLS static libs (only needed for the first build or when mbedTLS sou
 # Host shell
 rm -rf /tmp/mbedtls-rv-build
 
-cmake -S ./third_party/mbedtls \
+/usr/bin/cmake -S ./third_party/mbedtls \
   -B /tmp/mbedtls-rv-build \
   -G "Unix Makefiles" \
   -DCMAKE_SYSTEM_NAME=Generic \
@@ -70,7 +70,7 @@ cmake -S ./third_party/mbedtls \
   -DCMAKE_C_COMPILER=/usr/bin/riscv64-unknown-elf-gcc \
   -DCMAKE_AR=/usr/bin/riscv64-unknown-elf-ar \
   -DCMAKE_RANLIB=/usr/bin/riscv64-unknown-elf-ranlib \
-  -DCMAKE_C_FLAGS="-march=rv32imac -mabi=ilp32 -I$(pwd)" \
+  -DCMAKE_C_FLAGS="-march=rv32ima -mabi=ilp32 -I$(pwd)" \
   -DENABLE_PROGRAMS=OFF \
   -DENABLE_TESTING=OFF \
   -DGEN_FILES=ON \
@@ -80,6 +80,8 @@ cmake -S ./third_party/mbedtls \
   -DUSE_SHARED_TF_PSA_CRYPTO_LIBRARY=OFF \
   -DMBEDTLS_CONFIG_FILE=$(pwd)/third_party/mbedtls/configs/config-suite-b.h \
   -DMBEDTLS_USER_CONFIG_FILE=$(pwd)/ports/mbedtls/mbedtls_os_config.h \
+  -DTF_PSA_CRYPTO_CONFIG_FILE=$(pwd)/third_party/mbedtls/configs/crypto-config-suite-b.h \
+  -DTF_PSA_CRYPTO_USER_CONFIG_FILE=$(pwd)/ports/mbedtls/tf_psa_crypto_os_config.h \
   -DMBEDTLS_FATAL_WARNINGS=OFF \
   -DMBEDTLS_AS_SUBPROJECT=OFF \
   -DMBEDTLS_TARGET_PREFIX=rv_

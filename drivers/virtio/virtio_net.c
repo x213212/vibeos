@@ -178,7 +178,7 @@ void virtio_net_init() {
     vnet.avail = (net_virtq_avail_t *)(vnet.pages + rx_queue_size*sizeof(virtq_desc_t));
     vnet.used = (net_virtq_used_t *)(vnet.pages + PGSIZE);
     for(int i=0; i<rx_queue_size; i++) { vnet.desc[i].addr=(uint64)(uint32)&vnet.rx_buffers[i]; vnet.desc[i].len=ETH_FRAME_SIZE; vnet.desc[i].flags=2; vnet.avail->ring[i]=i; }
-    vnet.avail->idx = rx_queue_size; *R_NET(VIRTIO_MMIO_QUEUE_PFN) = (uint32)vnet.pages/PGSIZE; *R_NET(VIRTIO_MMIO_QUEUE_READY) = 1;
+    vnet.avail->idx = rx_queue_size; *R_NET(VIRTIO_MMIO_QUEUE_PFN) = (uint32)vnet.pages/PGSIZE;
     *R_NET(VIRTIO_MMIO_QUEUE_NOTIFY) = 0;
     *R_NET(VIRTIO_MMIO_QUEUE_SEL) = 1;
     qmax = *R_NET(VIRTIO_MMIO_QUEUE_NUM_MAX);
@@ -189,7 +189,7 @@ void virtio_net_init() {
     vnet.tx_desc = (virtq_desc_t *)vnet.tx_pages;
     vnet.tx_avail = (net_virtq_avail_t *)(vnet.tx_pages + tx_queue_size*sizeof(virtq_desc_t));
     vnet.tx_used = (net_virtq_used_t *)(vnet.tx_pages + PGSIZE);
-    *R_NET(VIRTIO_MMIO_QUEUE_PFN) = (uint32)vnet.tx_pages/PGSIZE; *R_NET(VIRTIO_MMIO_QUEUE_READY) = 1;
+    *R_NET(VIRTIO_MMIO_QUEUE_PFN) = (uint32)vnet.tx_pages/PGSIZE;
     *R_NET(VIRTIO_MMIO_STATUS) |= 4; lwip_init();
     ip4_addr_t ip, nm, gw; IP4_ADDR(&ip,192,168,123,1); IP4_ADDR(&nm,255,255,255,0); IP4_ADDR(&gw,192,168,123,1);
     netif_add(&vnet_netif, &ip, &nm, &gw, NULL, net_init_cb, ethernet_input);

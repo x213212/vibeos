@@ -299,6 +299,12 @@ static void terminal_apply_bashrc_line(struct Window *w, const char *line) {
                     struct dir_block *db;
                     int idx;
                     if (resolve_editor_target(w, expanded, &parent_bno, parent_cwd, leaf) == 0) {
+                        if (leaf[0] == '\0' || strcmp(leaf, ".") == 0) {
+                            w->cwd_bno = parent_bno ? parent_bno : 1;
+                            lib_strcpy(w->cwd, parent_cwd[0] ? parent_cwd : "/root");
+                            terminal_env_sync_pwd(w);
+                            goto terminal_cd_done;
+                        }
                         memset(tmp, 0, sizeof(*tmp));
                         tmp->cwd_bno = parent_bno ? parent_bno : 1;
                         lib_strcpy(tmp->cwd, parent_cwd[0] ? parent_cwd : "/root");
@@ -316,6 +322,7 @@ static void terminal_apply_bashrc_line(struct Window *w, const char *line) {
                 }
             }
         }
+terminal_cd_done:
         if (strncmp(buf, "unset ", 6) == 0) {
             char *namep = buf + 6;
             while (*namep == ' ') namep++;
