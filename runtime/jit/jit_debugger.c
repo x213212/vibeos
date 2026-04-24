@@ -6,6 +6,7 @@
 #include "user_wget.h"
 
 extern int jit_debug_snapshot(char *out, int out_max);
+extern int jit_debug_snapshot_prev(char *out, int out_max);
 extern int jit_debug_continue(char *out, int out_max);
 extern int jit_debug_step(char *out, int out_max);
 extern int jit_debug_step_instruction(char *out, int out_max);
@@ -15,7 +16,9 @@ extern int jit_debug_watch_dump(char *out, int out_max);
 extern int jit_debug_asm_dump(char *out, int out_max);
 extern int jit_debug_current_line(void);
 extern const char *jit_debug_current_file(void);
+extern int os_jit_cancel_by_owner(int owner_win_id);
 extern volatile int gui_redraw_needed;
+extern int gui_prev_regs_pressed;
 
 #define DBG_SPLIT_NONE 0
 #define DBG_SPLIT_VERT 1
@@ -32,6 +35,26 @@ static void dbg_set_status(struct Window *w, const char *msg) {
     if (!w) return;
     if (!msg) msg = "";
     lib_strcpy(w->editor_status, msg);
+}
+
+static const char *dbg_basename(const char *path) {
+    const char *base = path;
+    if (!path) return "";
+    while (*path) {
+        if (*path == '/' || *path == '\\') base = path + 1;
+        path++;
+    }
+    return base;
+}
+
+static int dbg_path_is_synthetic(const char *path) {
+    const char *base = dbg_basename(path);
+    int len;
+    if (!base || !base[0]) return 1;
+    if (strcmp(base, "<string>") == 0) return 1;
+    len = (int)strlen(base);
+    if (len >= 2 && base[0] == '<' && base[len - 1] == '>') return 1;
+    return 0;
 }
 
 static void dbg_append(char *out, int out_max, const char *s) {
@@ -174,7 +197,7 @@ static void dbg_draw_asm_watch_lines(int x, int y, int y_end, int pane_w,
                 is_current = (line[0] == '=' && line[1] == '>');
                 is_range = (line[0] == '*' && line[1] == ' ');
                 if (is_current) {
-                    draw_rect_fill(x - 2, row_y - 2, pane_w - 8, line_h, UI_C_SELECTION);
+                    draw_rect_fill(x - 2, row_y - 1, pane_w - 8, line_h - 2, UI_C_SELECTION);
                     dbg_draw_text_slice(x, row_y, line, UI_C_TEXT, max_chars, scroll_x);
                 } else if (is_range) {
                     dbg_draw_text_slice(x, row_y, line, UI_C_TEXT_MUTED, max_chars, scroll_x);
@@ -431,6 +454,13 @@ static void dbg_build_asm_watch_pane(char *out, int out_max) {
     dbg_append(out, out_max, watch_buf);
 }
 
+static void dbg_build_regs_pane(char *out, int out_max) {
+    if (!out || out_max <= 0) return;
+    out[0] = '\0';
+    if (gui_prev_regs_pressed && jit_debug_snapshot_prev(out, out_max) == 0) return;
+    jit_debug_snapshot(out, out_max);
+}
+
 static int dbg_source_max_line_len(struct Window *w) {
     int max_len = 0;
     if (!w) return 0;
@@ -445,7 +475,8 @@ static int dbg_pane_content_lines(struct Window *w, int pane) {
     char tmp[OUT_BUF_SIZE];
     if (!w) return 0;
     if (pane == DBG_PANE_REGS) {
-        if (jit_debug_snapshot(tmp, sizeof(tmp)) != 0) return 0;
+        dbg_build_regs_pane(tmp, sizeof(tmp));
+        if (!tmp[0]) return 0;
         return dbg_text_line_count(tmp);
     }
     if (pane == DBG_PANE_MEM) {
@@ -461,7 +492,8 @@ static int dbg_pane_content_cols(struct Window *w, int pane) {
     char tmp[OUT_BUF_SIZE];
     if (!w) return 0;
     if (pane == DBG_PANE_REGS) {
-        if (jit_debug_snapshot(tmp, sizeof(tmp)) != 0) return 0;
+        dbg_build_regs_pane(tmp, sizeof(tmp));
+        if (!tmp[0]) return 0;
         return dbg_text_max_line_len(tmp);
     }
     if (pane == DBG_PANE_MEM) {
@@ -499,19 +531,87 @@ static void dbg_clamp_all_scroll(struct Window *w, int x, int y, int ww, int wh)
     w->debug_console_scroll_y = dbg_clamp_int(w->debug_console_scroll_y, 0, dbg_pane_max_scroll_y(w, DBG_PANE_CONSOLE, x, y, ww, wh));
 }
 
+static int dbg_load_source_path(struct Window *w, const char *path) {
+    unsigned char *buf = NULL;
+    uint32_t size = 0;
+    uint32_t p_bno = 0;
+    char p_cwd[128];
+    char leaf[20];
+    char abs_path[128];
+
+    if (!w || !path || !path[0]) return -1;
+    if (resolve_editor_target(w, path, &p_bno, p_cwd, leaf) != 0 || !leaf[0]) {
+        lib_printf("[JITDBG] source load resolve fail path=%s\n", path ? path : "(null)");
+        return -1;
+    }
+    lib_printf("[JITDBG] source load resolve ok path=%s cwd=%s leaf=%s bno=%u\n",
+               path, p_cwd[0] ? p_cwd : "/root", leaf, p_bno);
+    if (load_file_bytes_alloc(w, path, &buf, &size) != 0 || !buf) {
+        lib_printf("[JITDBG] source load read fail path=%s\n", path);
+        return -1;
+    }
+
+    build_editor_path(abs_path, p_cwd, leaf);
+    editor_load_bytes(w, buf, size);
+    free(buf);
+    buf = NULL;
+
+    lib_strcpy(w->editor_name, leaf);
+    lib_strcpy(w->editor_path, abs_path);
+    lib_strcpy(w->debug_source_path, abs_path);
+    lib_strcpy(w->editor_cwd, p_cwd[0] ? p_cwd : "/root");
+    w->cwd_bno = p_bno ? p_bno : 1;
+    w->editor_file_bno = 0;
+    w->editor_file_size = size;
+    w->editor_readonly = 1;
+    lib_strcpy(w->title, "JIT Debugger: ");
+    shorten_path_for_title(w->title + strlen(w->title), abs_path, 40);
+    lib_printf("[JITDBG] source load ok path=%s abs=%s size=%u\n", path, abs_path, size);
+    return 0;
+}
+
 static void dbg_reload_source_if_needed(struct Window *w) {
     const char *file = jit_debug_current_file();
-    uint32_t size = 0;
+    char fallback[128];
+    const char *base;
     if (!w || !file || !file[0]) return;
-    if (strcmp(w->editor_path, file) == 0) return;
-    if (load_file_bytes(w, file, file_io_buf, WGET_MAX_FILE_SIZE, &size) != 0) {
-        dbg_set_status(w, "debug source load failed");
+    if (dbg_path_is_synthetic(file)) {
+        lib_printf("[JITDBG] source reload skip synthetic=%s current=%s\n",
+                   file,
+                   w->debug_source_path[0] ? w->debug_source_path : "(none)");
         return;
     }
-    editor_load_bytes(w, file_io_buf, size);
-    lib_strcpy(w->editor_path, file);
-    lib_strcpy(w->title, "JIT Debugger: ");
-    shorten_path_for_title(w->title + strlen(w->title), file, 40);
+    if (strcmp(w->debug_source_path, file) == 0) return;
+    lib_printf("[JITDBG] source reload want=%s current=%s entry=%s\n",
+               file,
+               w->debug_source_path[0] ? w->debug_source_path : "(none)",
+               w->debug_entry_path[0] ? w->debug_entry_path : "(none)");
+    if (dbg_load_source_path(w, file) == 0) return;
+
+    base = dbg_basename(file);
+    if (base[0] && strcmp(base, dbg_basename(w->debug_source_path)) == 0) {
+        lib_printf("[JITDBG] source reload keep-current file=%s base=%s current=%s\n",
+                   file, base, w->debug_source_path[0] ? w->debug_source_path : "(none)");
+        return;
+    }
+
+    fallback[0] = '\0';
+    if (w->debug_entry_path[0]) {
+        const char *entry_base = dbg_basename(w->debug_entry_path);
+        int cwd_len = (int)strlen(w->debug_entry_path) - (int)strlen(entry_base);
+        if (cwd_len > 0) {
+            if (cwd_len >= (int)sizeof(fallback)) cwd_len = (int)sizeof(fallback) - 1;
+            memcpy(fallback, w->debug_entry_path, (size_t)cwd_len);
+            fallback[cwd_len] = '\0';
+            if (base[0]) lib_strcat(fallback, base);
+        }
+    }
+    if (fallback[0]) lib_printf("[JITDBG] source reload fallback=%s base=%s\n", fallback, base[0] ? base : "(none)");
+    if (fallback[0] && dbg_load_source_path(w, fallback) == 0) return;
+
+    lib_printf("[JITDBG] source reload failed want=%s fallback=%s\n",
+               file, fallback[0] ? fallback : "(none)");
+    dbg_set_status(w, "debug source load failed");
 }
 
 void draw_jit_debugger_content(struct Window *w, int x, int y, int ww, int wh) {
@@ -543,7 +643,7 @@ void draw_jit_debugger_content(struct Window *w, int x, int y, int ww, int wh) {
     draw_text(right_x + 12, lower_y + 8, "Console", UI_C_TEXT);
 
     dbg_reload_source_if_needed(w);
-    jit_debug_snapshot(snap, sizeof(snap));
+    dbg_build_regs_pane(snap, sizeof(snap));
     left_chars = (split_x - 22) / 8;
     if (left_chars < 20) left_chars = 20;
     dbg_draw_snapshot_lines(area_x + 8, area_y + 26, lower_y - 10, snap, left_chars,
@@ -564,12 +664,14 @@ void draw_jit_debugger_content(struct Window *w, int x, int y, int ww, int wh) {
     right_chars = (area_w - split_x - 58) / 8;
     if (right_chars < 20) right_chars = 20;
     {
+        int source_base_line = w->editor_loaded_start_line + 1;
+        int current_row = current_line - source_base_line;
         int visible_source_lines = (lower_y - 4 - row_y) / line_h;
         if (visible_source_lines < 1) visible_source_lines = 1;
-        if (current_line > 0 &&
-            (current_line <= w->debug_source_scroll_y ||
-             current_line > w->debug_source_scroll_y + visible_source_lines)) {
-            w->debug_source_scroll_y = current_line - 3;
+        if (current_row >= 0 &&
+            (current_row < w->debug_source_scroll_y ||
+             current_row >= w->debug_source_scroll_y + visible_source_lines)) {
+            w->debug_source_scroll_y = current_row - 2;
             if (w->debug_source_scroll_y < 0) w->debug_source_scroll_y = 0;
         }
     }
@@ -579,12 +681,13 @@ void draw_jit_debugger_content(struct Window *w, int x, int y, int ww, int wh) {
                                              dbg_pane_max_scroll_y(w, DBG_PANE_SOURCE, x, y, ww, wh));
     for (int i = w->debug_source_scroll_y; i < w->editor_line_count && row_y < lower_y - 4; i++) {
         char num[12];
-        int is_current = (current_line > 0 && i + 1 == current_line);
+        int line_no = w->editor_loaded_start_line + i + 1;
+        int is_current = (current_line > 0 && line_no == current_line);
 
         if (is_current) {
-            draw_rect_fill(right_x + 8, row_y - 2, area_w - split_x - 16, line_h, UI_C_SELECTION);
+            draw_rect_fill(right_x + 8, row_y - 1, area_w - split_x - 16, line_h - 2, UI_C_SELECTION);
         }
-        lib_itoa((uint32_t)i + 1U, num);
+        lib_itoa((uint32_t)line_no, num);
         draw_text(right_x + 12, row_y, num, is_current ? UI_C_TEXT : UI_C_TEXT_DIM);
         dbg_draw_text_slice(right_x + 48, row_y, w->editor_lines[i], UI_C_TEXT, right_chars, w->debug_source_scroll_x);
         row_y += line_h;
@@ -700,6 +803,7 @@ int open_jit_debugger_window(struct Window *term, const char *path) {
         shorten_path_for_title(wins[i].title + strlen(wins[i].title), abs_path, 40);
         lib_strcpy(wins[i].editor_path, abs_path);
         lib_strcpy(wins[i].debug_entry_path, abs_path);
+        lib_strcpy(wins[i].debug_source_path, abs_path);
         lib_strcpy(wins[i].editor_cwd, p_cwd[0] ? p_cwd : "/root");
         wins[i].cwd_bno = p_bno ? p_bno : 1;
         editor_load_bytes(&wins[i], file_io_buf, size);
@@ -711,8 +815,8 @@ int open_jit_debugger_window(struct Window *term, const char *path) {
         wins[i].debug_drag_split = 0;
         dbg_console_clear(&wins[i]);
         dbg_set_status(&wins[i], ":b file.c line  :watch addr len  :si step  :c continue  :r rerun");
-        bring_to_front(i);
-        return 0;
+            bring_to_front(i);
+            return i;
     }
     return -3;
 }
@@ -732,7 +836,8 @@ int jit_debugger_exec_cmd(struct Window *term, char *arg, char *out, int out_max
             jit_debug_snapshot(out, out_max);
             return 1;
         }
-        if (open_jit_debugger_window(term, arg) != 0) {
+        int dbg_win_id = open_jit_debugger_window(term, arg);
+        if (dbg_win_id < 0) {
             lib_strcpy(out, "ERR: Debugger source open failed.");
             return 1;
         }
@@ -742,7 +847,7 @@ int jit_debugger_exec_cmd(struct Window *term, char *arg, char *out, int out_max
         }
         build_editor_path(abs_path, p_cwd, leaf);
         appfs_set_cwd(term->cwd_bno, term->cwd);
-        os_jit_run_bg_debug_file(abs_path, term->id, out, out_max);
+        os_jit_run_bg_debug_file(abs_path, dbg_win_id, out, out_max);
         return 1;
     }
 
@@ -778,6 +883,7 @@ static void jit_debugger_apply_command(struct Window *w) {
     } else if (strcmp(w->editor_cmd, "r") == 0 || strcmp(w->editor_cmd, "run") == 0) {
         const char *path = w->debug_entry_path[0] ? w->debug_entry_path : w->editor_path;
         dbg_console_clear(w);
+        os_jit_cancel_by_owner(w->id);
         appfs_set_cwd(w->cwd_bno, w->editor_cwd[0] ? w->editor_cwd : "/root");
         os_jit_run_bg_debug_file(path, w->id, msg, sizeof(msg));
         dbg_set_status(w, msg);

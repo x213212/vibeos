@@ -129,6 +129,7 @@ struct Window {
     char editor_name[20], editor_cwd[128], editor_status[EDITOR_STATUS_LEN];
     char editor_path[128];
     char debug_entry_path[128];
+    char debug_source_path[128];
     int debug_split_x, debug_split_y, debug_drag_split;
     int debug_regs_scroll_x, debug_regs_scroll_y;
     int debug_mem_scroll_x, debug_mem_scroll_y;

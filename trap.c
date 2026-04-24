@@ -7,6 +7,12 @@ extern char _text_end;
 #define CTRLDBG_PRINTF(...) do { } while (0)
 #define JIT_DEBUG_MAX_BREAKPOINTS 64
 #define JIT_DEBUG_LINE_MAP_MAX 512
+#define JIT_DEBUG_LINE_FLAG_IS_STMT         0x0001u
+#define JIT_DEBUG_LINE_FLAG_BASIC_BLOCK     0x0002u
+#define JIT_DEBUG_LINE_FLAG_PROLOGUE_END    0x0004u
+#define JIT_DEBUG_LINE_FLAG_EPILOGUE_BEGIN  0x0008u
+#define JIT_DEBUG_LINE_FLAG_END_SEQUENCE    0x0010u
+#define JIT_DEBUG_LINE_FLAG_PROBE           0x8000u
 extern void trap_vector();
 extern void virtio_disk_isr();
 extern void virtio_net_interrupt_handler();
@@ -38,6 +44,10 @@ struct jit_debug_snapshot_state {
     uint32_t watch_hit_size;
     uint32_t watch_hit_is_store;
     uint32_t watch_hit_count;
+    uint32_t column;
+    uint32_t discriminator;
+    uint16_t line_flags;
+    uint16_t line_isa;
     char file[128];
     reg_t epc;
     reg_t regs[31];
@@ -55,7 +65,13 @@ struct jit_debug_breakpoint {
 struct jit_debug_line_map_entry {
     int used;
     uint32_t pc;
+    uint32_t end_pc;
     int line;
+    uint32_t column;
+    uint32_t discriminator;
+    uint16_t flags;
+    uint16_t isa;
+    uint8_t quality;
     char file[128];
 };
 
@@ -71,11 +87,15 @@ static struct {
 } jit_debug_temp_breaks[2];
 static uint32_t jit_debug_code_lo;
 static uint32_t jit_debug_code_hi;
+static uint32_t jit_debug_probe_pc;
 reg_t jit_debug_saved_frame[31];
+extern volatile int gui_redraw_needed;
 
 static int jit_debug_addr_in_code(uint32_t addr);
+static int jit_debug_addr_stepable(uint32_t addr);
 void jit_debug_set_location(const char *file, int line);
 static void jit_debug_apply_line_map(uint32_t pc);
+static uint32_t jit_debug_read_insn(uint32_t pc);
 
 static const char *jit_debug_addr_class(uint32_t addr) {
     if (jit_debug_addr_in_code(addr)) return "JIT";
@@ -128,15 +148,67 @@ static int jit_debug_breakpoint_matches(const char *file, int line) {
     return 0;
 }
 
-void jit_debug_record_line_pc(uint32_t pc, const char *file, int line) {
+static int jit_debug_file_is_synthetic(const char *file) {
+    const char *base;
+    size_t len;
+    if (!file || !file[0]) return 1;
+    base = jit_debug_basename(file);
+    len = strlen(base);
+    if (strcmp(base, "<string>") == 0) return 1;
+    if (len >= 2 && base[0] == '<' && base[len - 1] == '>') return 1;
+    return 0;
+}
+
+static uint8_t jit_debug_line_quality(const char *file, int probe_hint) {
+    if (probe_hint) return 2;
+    return jit_debug_file_is_synthetic(file) ? 0 : 1;
+}
+
+static void jit_debug_write_line_entry(int slot,
+                                       uint32_t start_pc,
+                                       uint32_t end_pc,
+                                       const char *file,
+                                       int line,
+                                       uint32_t column,
+                                       uint32_t discriminator,
+                                       uint16_t flags,
+                                       uint16_t isa,
+                                       uint8_t quality) {
+    jit_debug_line_map[slot].used = 1;
+    jit_debug_line_map[slot].pc = start_pc;
+    jit_debug_line_map[slot].end_pc = end_pc;
+    jit_debug_line_map[slot].line = line;
+    jit_debug_line_map[slot].column = column;
+    jit_debug_line_map[slot].discriminator = discriminator;
+    jit_debug_line_map[slot].flags = flags;
+    jit_debug_line_map[slot].isa = isa;
+    jit_debug_line_map[slot].quality = quality;
+    strncpy(jit_debug_line_map[slot].file, file, sizeof(jit_debug_line_map[slot].file) - 1);
+    jit_debug_line_map[slot].file[sizeof(jit_debug_line_map[slot].file) - 1] = '\0';
+}
+
+static void jit_debug_record_line_span(uint32_t start_pc,
+                                       uint32_t end_pc,
+                                       const char *file,
+                                       int line,
+                                       uint32_t column,
+                                       uint32_t discriminator,
+                                       uint16_t flags,
+                                       uint16_t isa,
+                                       int probe_hint) {
     int slot;
-    if (!pc || !file || !file[0] || line <= 0) return;
+    uint8_t quality;
+    if (!start_pc || !file || !file[0] || line <= 0) return;
+    if (end_pc && end_pc <= start_pc) return;
+    quality = jit_debug_line_quality(file, probe_hint);
+    if (probe_hint) flags |= JIT_DEBUG_LINE_FLAG_PROBE;
     for (int i = 0; i < JIT_DEBUG_LINE_MAP_MAX; i++) {
         if (!jit_debug_line_map[i].used) continue;
-        if (jit_debug_line_map[i].pc != pc) continue;
-        jit_debug_line_map[i].line = line;
-        strncpy(jit_debug_line_map[i].file, file, sizeof(jit_debug_line_map[i].file) - 1);
-        jit_debug_line_map[i].file[sizeof(jit_debug_line_map[i].file) - 1] = '\0';
+        if (jit_debug_line_map[i].pc != start_pc) continue;
+        if (jit_debug_line_map[i].end_pc != end_pc) continue;
+        if (quality < jit_debug_line_map[i].quality) return;
+        jit_debug_write_line_entry(i, start_pc, end_pc, file, line,
+                                   column, discriminator, flags, isa, quality);
         return;
     }
     slot = -1;
@@ -150,38 +222,94 @@ void jit_debug_record_line_pc(uint32_t pc, const char *file, int line) {
         slot = jit_debug_line_map_next++;
         if (jit_debug_line_map_next >= JIT_DEBUG_LINE_MAP_MAX) jit_debug_line_map_next = 0;
     }
-    jit_debug_line_map[slot].used = 1;
-    jit_debug_line_map[slot].pc = pc;
-    jit_debug_line_map[slot].line = line;
-    strncpy(jit_debug_line_map[slot].file, file, sizeof(jit_debug_line_map[slot].file) - 1);
-    jit_debug_line_map[slot].file[sizeof(jit_debug_line_map[slot].file) - 1] = '\0';
+    jit_debug_write_line_entry(slot, start_pc, end_pc, file, line,
+                               column, discriminator, flags, isa, quality);
 }
 
-static int jit_debug_lookup_line_pc(uint32_t pc, char *file, int file_max, int *line) {
-    int best = -1;
-    uint32_t best_pc = 0;
+void jit_debug_record_line_pc(uint32_t pc, const char *file, int line) {
+    jit_debug_record_line_span(pc, 0, file, line, 0, 0, 0, 0, 0);
+}
+
+void jit_debug_record_line_pc_probe(uint32_t pc, const char *file, int line) {
+    jit_debug_record_line_span(pc, 0, file, line, 0, 0, 0, 0, 1);
+}
+
+void jit_debug_record_line_range(uint32_t start_pc, uint32_t end_pc, const char *file, int line) {
+    jit_debug_record_line_span(start_pc, end_pc, file, line, 0, 0, 0, 0, 0);
+}
+
+void jit_debug_record_line_range_ex(uint32_t start_pc, uint32_t end_pc,
+                                    const char *file, int line,
+                                    uint32_t column, uint32_t discriminator,
+                                    uint16_t flags, uint16_t isa) {
+    jit_debug_record_line_span(start_pc, end_pc, file, line,
+                               column, discriminator, flags, isa, 0);
+}
+
+static const struct jit_debug_line_map_entry *jit_debug_lookup_line_pc_entry(uint32_t pc) {
+    const struct jit_debug_line_map_entry *range = NULL;
+    const struct jit_debug_line_map_entry *exact = NULL;
     if (!pc) return 0;
     for (int i = 0; i < JIT_DEBUG_LINE_MAP_MAX; i++) {
         if (!jit_debug_line_map[i].used) continue;
-        if (jit_debug_line_map[i].pc > pc) continue;
-        if (best < 0 || jit_debug_line_map[i].pc >= best_pc) {
-            best = i;
-            best_pc = jit_debug_line_map[i].pc;
+        if (jit_debug_line_map[i].end_pc > jit_debug_line_map[i].pc &&
+            pc >= jit_debug_line_map[i].pc && pc < jit_debug_line_map[i].end_pc) {
+            if (!range ||
+                jit_debug_line_map[i].pc > range->pc ||
+                (jit_debug_line_map[i].pc == range->pc &&
+                 jit_debug_line_map[i].end_pc < range->end_pc) ||
+                (jit_debug_line_map[i].pc == range->pc &&
+                 jit_debug_line_map[i].end_pc == range->end_pc &&
+                 jit_debug_line_map[i].quality > range->quality)) {
+                range = &jit_debug_line_map[i];
+            }
+            continue;
+        }
+        if (jit_debug_line_map[i].pc == pc) {
+            if (!exact || jit_debug_line_map[i].quality > exact->quality) {
+                exact = &jit_debug_line_map[i];
+            }
         }
     }
-    if (best < 0) return 0;
+    return range ? range : exact;
+}
+
+static int jit_debug_lookup_line_pc(uint32_t pc, char *file, int file_max, int *line,
+                                    uint32_t *column, uint32_t *discriminator,
+                                    uint16_t *flags, uint16_t *isa) {
+    const struct jit_debug_line_map_entry *entry = jit_debug_lookup_line_pc_entry(pc);
+    if (!entry) return 0;
     if (file && file_max > 0) {
-        strncpy(file, jit_debug_line_map[best].file, file_max - 1);
+        strncpy(file, entry->file, file_max - 1);
         file[file_max - 1] = '\0';
     }
-    if (line) *line = jit_debug_line_map[best].line;
+    if (line) *line = entry->line;
+    if (column) *column = entry->column;
+    if (discriminator) *discriminator = entry->discriminator;
+    if (flags) *flags = entry->flags;
+    if (isa) *isa = entry->isa;
     return 1;
 }
 
 static void jit_debug_apply_line_map(uint32_t pc) {
     char file[128];
     int line = 0;
-    if (!jit_debug_lookup_line_pc(pc, file, sizeof(file), &line)) return;
+    uint32_t column = 0;
+    uint32_t discriminator = 0;
+    uint16_t flags = 0;
+    uint16_t isa = 0;
+    if (!jit_debug_lookup_line_pc(pc, file, sizeof(file), &line,
+                                  &column, &discriminator, &flags, &isa)) {
+        return;
+    }
+    jit_debug_last.column = column;
+    jit_debug_last.discriminator = discriminator;
+    jit_debug_last.line_flags = flags;
+    jit_debug_last.line_isa = isa;
+    if (jit_debug_file_is_synthetic(file)) {
+        jit_debug_set_line(line);
+        return;
+    }
     jit_debug_set_location(file, line);
 }
 
@@ -233,6 +361,47 @@ static int jit_debug_branch_taken(uint32_t insn, const reg_t *r) {
 static int jit_debug_insn_len(uint32_t addr) {
     uint16_t h = *(volatile uint16_t *)(uintptr_t)addr;
     return ((h & 3u) == 3u) ? 4 : 2;
+}
+
+static uint32_t jit_debug_read_insn(uint32_t pc) {
+    if (jit_debug_insn_len(pc) == 2) {
+        return (uint32_t)*(volatile uint16_t *)(uintptr_t)pc;
+    }
+    return *(volatile uint32_t *)(uintptr_t)pc;
+}
+
+static int jit_debug_insn_is_rv32_word(uint32_t insn) {
+    return (insn & 3u) == 3u;
+}
+
+static int32_t jit_debug_u_imm20(uint32_t insn) {
+    return (int32_t)insn >> 12;
+}
+
+static int jit_debug_rv32_bare_mem_fault(uint32_t insn) {
+    uint32_t op = insn & 0x7fu;
+    uint32_t rs1 = (insn >> 15) & 31u;
+    int32_t imm;
+    if (op == 0x03u) {
+        imm = jit_debug_sext(insn >> 20, 12);
+    } else if (op == 0x23u) {
+        imm = jit_debug_sext(((insn >> 25) << 5) | ((insn >> 7) & 0x1fu), 12);
+    } else {
+        return 0;
+    }
+    return rs1 == 0u && imm >= -16 && imm < 4096;
+}
+
+static int jit_debug_c_insn_valid(uint16_t h) {
+    uint32_t op = h & 3u;
+    uint32_t f3 = (h >> 13) & 7u;
+    if (!h) return 0;
+    if (op == 0u && f3 == 0u) {
+        uint32_t nzuimm = ((h >> 7) & 0x30u) | ((h >> 1) & 0x3c0u) |
+                          ((h >> 4) & 0x4u) | ((h >> 2) & 0x8u);
+        if (!nzuimm) return 0;
+    }
+    return 1;
 }
 
 static int32_t jit_debug_cj_imm(uint16_t h) {
@@ -303,6 +472,168 @@ static uint32_t jit_debug_next_addr(uint32_t pc) {
     return pc + (uint32_t)jit_debug_insn_len(pc);
 }
 
+static void jit_debug_format_c_insn(uint32_t pc, uint16_t h, char *out, int out_max) {
+    uint32_t op = h & 3u;
+    uint32_t f3 = (h >> 13) & 7u;
+    int rd = (h >> 7) & 31;
+    int rs2 = (h >> 2) & 31;
+    int imm;
+
+    if (!out || out_max <= 0) return;
+    out[0] = '\0';
+    if (!h) {
+        snprintf(out, out_max, "c.invalid h=%x", (uint32_t)h);
+        return;
+    }
+
+    if (op == 0u) {
+        if (f3 == 0u) {
+            uint32_t nzuimm = ((h >> 7) & 0x30u) | ((h >> 1) & 0x3c0u) |
+                              ((h >> 4) & 0x4u) | ((h >> 2) & 0x8u);
+            if (!nzuimm) {
+                snprintf(out, out_max, "c.invalid-addi4spn h=%x", (uint32_t)h);
+                return;
+            }
+            snprintf(out, out_max, "c.addi4spn %s,sp,%d",
+                     jit_debug_reg_name(8 + ((h >> 2) & 7u)), (int)nzuimm);
+            return;
+        }
+        if (f3 == 2u) {
+            imm = (int)(((h >> 4) & 0x4u) | ((h >> 7) & 0x38u) | ((h << 1) & 0x40u));
+            snprintf(out, out_max, "c.lw %s,%d(%s)",
+                     jit_debug_reg_name(8 + ((h >> 2) & 7u)), imm,
+                     jit_debug_reg_name(8 + ((h >> 7) & 7u)));
+            return;
+        }
+        if (f3 == 6u) {
+            imm = (int)(((h >> 4) & 0x4u) | ((h >> 7) & 0x38u) | ((h << 1) & 0x40u));
+            snprintf(out, out_max, "c.sw %s,%d(%s)",
+                     jit_debug_reg_name(8 + ((h >> 2) & 7u)), imm,
+                     jit_debug_reg_name(8 + ((h >> 7) & 7u)));
+            return;
+        }
+    } else if (op == 1u) {
+        if (f3 == 0u) {
+            imm = jit_debug_sext(((h >> 2) & 0x1fu) | ((h >> 7) & 0x20u), 6);
+            if (rd == 0 && imm == 0) snprintf(out, out_max, "c.nop");
+            else snprintf(out, out_max, "c.addi %s,%d", jit_debug_reg_name(rd), imm);
+            return;
+        }
+        if (f3 == 1u || f3 == 5u) {
+            snprintf(out, out_max, "%s %x", f3 == 1u ? "c.jal" : "c.j", pc + jit_debug_cj_imm(h));
+            return;
+        }
+        if (f3 == 2u) {
+            imm = jit_debug_sext(((h >> 2) & 0x1fu) | ((h >> 7) & 0x20u), 6);
+            snprintf(out, out_max, "c.li %s,%d", jit_debug_reg_name(rd), imm);
+            return;
+        }
+        if (f3 == 3u) {
+            imm = jit_debug_sext(((h >> 2) & 0x1fu) | ((h >> 7) & 0x20u), 6);
+            if (rd == 2) snprintf(out, out_max, "c.addi16sp %d", imm);
+            else snprintf(out, out_max, "c.lui %s,%d", jit_debug_reg_name(rd), imm);
+            return;
+        }
+        if (f3 == 6u || f3 == 7u) {
+            snprintf(out, out_max, "%s %s,%x", f3 == 6u ? "c.beqz" : "c.bnez",
+                     jit_debug_reg_name(8 + ((h >> 7) & 7u)), pc + jit_debug_cb_imm(h));
+            return;
+        }
+    } else if (op == 2u) {
+        if (f3 == 0u) {
+            imm = (int)(((h >> 2) & 0x1fu) | ((h >> 7) & 0x20u));
+            snprintf(out, out_max, "c.slli %s,%d", jit_debug_reg_name(rd), imm);
+            return;
+        }
+        if (f3 == 2u) {
+            imm = (int)(((h >> 2) & 0x1cu) | ((h >> 7) & 0x20u) | ((h << 4) & 0x40u));
+            snprintf(out, out_max, "c.lwsp %s,%d(sp)", jit_debug_reg_name(rd), imm);
+            return;
+        }
+        if (f3 == 4u) {
+            int bit12 = (h >> 12) & 1u;
+            if (!bit12 && rd && !rs2) snprintf(out, out_max, "c.jr %s", jit_debug_reg_name(rd));
+            else if (!bit12 && rd && rs2) snprintf(out, out_max, "c.mv %s,%s", jit_debug_reg_name(rd), jit_debug_reg_name(rs2));
+            else if (bit12 && rd && !rs2) snprintf(out, out_max, "c.jalr %s", jit_debug_reg_name(rd));
+            else if (bit12 && !rd && !rs2) snprintf(out, out_max, "c.ebreak");
+            else if (bit12 && rd && rs2) snprintf(out, out_max, "c.add %s,%s", jit_debug_reg_name(rd), jit_debug_reg_name(rs2));
+            else snprintf(out, out_max, "c.misc h=%x", (uint32_t)h);
+            return;
+        }
+        if (f3 == 6u) {
+            imm = (int)(((h >> 7) & 0x3cu) | ((h >> 1) & 0xc0u));
+            snprintf(out, out_max, "c.swsp %s,%d(sp)", jit_debug_reg_name(rs2), imm);
+            return;
+        }
+    }
+
+    snprintf(out, out_max, "c.unknown h=%x", (uint32_t)h);
+}
+
+static int jit_debug_try_resolve_jit_stub_target(uint32_t pc, uint32_t *stub_target) {
+    uint32_t insn0;
+    uint32_t insn1;
+    uint32_t insn2;
+    uint32_t got_addr;
+    int rd0;
+    int rd1;
+    int rs1_1;
+    int rd2;
+    int rs1_2;
+    int32_t hi20;
+    int32_t lo12;
+    int32_t jalr_imm;
+
+    if (stub_target) *stub_target = 0;
+    if (!jit_debug_addr_stepable(pc)) return 0;
+    if (jit_debug_insn_len(pc) != 4 ||
+        jit_debug_insn_len(pc + 4) != 4 ||
+        jit_debug_insn_len(pc + 8) != 4) {
+        return 0;
+    }
+
+    insn0 = *(volatile uint32_t *)(uintptr_t)pc;
+    insn1 = *(volatile uint32_t *)(uintptr_t)(pc + 4);
+    insn2 = *(volatile uint32_t *)(uintptr_t)(pc + 8);
+
+    if ((insn0 & 0x7f) != 0x17) return 0;
+    if ((insn1 & 0x7f) != 0x03 || ((insn1 >> 12) & 7) != 2) return 0;
+    if ((insn2 & 0x7f) != 0x67) return 0;
+
+    rd0 = (insn0 >> 7) & 31;
+    rd1 = (insn1 >> 7) & 31;
+    rs1_1 = (insn1 >> 15) & 31;
+    rd2 = (insn2 >> 7) & 31;
+    rs1_2 = (insn2 >> 15) & 31;
+    if (rd0 == 0 || rd1 != rd0 || rs1_1 != rd0 || rs1_2 != rd0 || rd2 == 0) return 0;
+
+    hi20 = (int32_t)(insn0 & 0xfffff000u);
+    lo12 = jit_debug_sext(insn1 >> 20, 12);
+    jalr_imm = jit_debug_sext(insn2 >> 20, 12);
+    got_addr = (uint32_t)(pc + hi20 + lo12);
+    if (!got_addr) return 0;
+
+    if (stub_target) *stub_target = (*(volatile uint32_t *)(uintptr_t)got_addr + (uint32_t)jalr_imm) & ~1u;
+    return 1;
+}
+
+static uint32_t jit_debug_single_step_pc(uint32_t pc, uint32_t target, int rd, int *resolved_external) {
+    uint32_t stub_target = 0;
+
+    if (resolved_external) *resolved_external = 0;
+    if (!rd) return target;
+    if (!jit_debug_addr_stepable(target)) {
+        if (resolved_external) *resolved_external = 1;
+        return jit_debug_next_addr(pc);
+    }
+    if (jit_debug_try_resolve_jit_stub_target(target, &stub_target) &&
+        !jit_debug_addr_stepable(stub_target)) {
+        if (resolved_external) *resolved_external = 1;
+        return jit_debug_next_addr(pc);
+    }
+    return target;
+}
+
 static void jit_debug_format_insn(uint32_t pc, uint32_t insn, char *out, int out_max) {
     uint32_t op = insn & 0x7f;
     int rd = (insn >> 7) & 31;
@@ -313,6 +644,11 @@ static void jit_debug_format_insn(uint32_t pc, uint32_t insn, char *out, int out
 
     if (!out || out_max <= 0) return;
     out[0] = '\0';
+
+    if (!jit_debug_insn_is_rv32_word(insn)) {
+        jit_debug_format_c_insn(pc, (uint16_t)(insn & 0xffffu), out, out_max);
+        return;
+    }
 
     if (insn == 0x00100073) {
         snprintf(out, out_max, "ebreak");
@@ -325,10 +661,12 @@ static void jit_debug_format_insn(uint32_t pc, uint32_t insn, char *out, int out
 
     switch (op) {
     case 0x37:
-        snprintf(out, out_max, "lui %s,0x%x", jit_debug_reg_name(rd), insn & 0xfffff000);
+        snprintf(out, out_max, "lui %s,0x%x", jit_debug_reg_name(rd), (uint32_t)(insn >> 12));
         break;
     case 0x17:
-        snprintf(out, out_max, "auipc %s,0x%x", jit_debug_reg_name(rd), insn & 0xfffff000);
+        imm = jit_debug_u_imm20(insn);
+        if (imm < 0) snprintf(out, out_max, "auipc %s,-0x%x", jit_debug_reg_name(rd), (uint32_t)-imm);
+        else snprintf(out, out_max, "auipc %s,0x%x", jit_debug_reg_name(rd), (uint32_t)imm);
         break;
     case 0x6f:
         imm = jit_debug_sext(((insn >> 31) << 20) | (((insn >> 12) & 0xff) << 12) |
@@ -405,7 +743,7 @@ static void jit_debug_format_insn(uint32_t pc, uint32_t insn, char *out, int out
         }
         break;
     default:
-        snprintf(out, out_max, "insn 0x%08x", insn);
+        snprintf(out, out_max, "unknown-rv32 word=%x op=%x", insn, op);
         break;
     }
 }
@@ -424,7 +762,7 @@ int jit_debug_asm_dump(char *out, int out_max) {
         return -1;
     }
     pc = (uint32_t)jit_debug_last.epc;
-    if (!jit_debug_addr_in_code(pc)) {
+    if (!jit_debug_addr_stepable(pc)) {
         snprintf(out, out_max, "asm: pc outside jit text: %x", pc);
         return -1;
     }
@@ -436,9 +774,7 @@ int jit_debug_asm_dump(char *out, int out_max) {
     if (jit_debug_last.valid) {
         uint32_t cur_pc = (uint32_t)jit_debug_last.epc;
         int cur_len = jit_debug_insn_len(cur_pc);
-        uint32_t cur_insn = (cur_len == 2)
-                                ? (uint32_t)*(volatile uint16_t *)(uintptr_t)cur_pc
-                                : *(volatile uint32_t *)(uintptr_t)cur_pc;
+        uint32_t cur_insn = jit_debug_read_insn(cur_pc);
         uint32_t op = cur_insn & 0x7f;
         if (cur_len == 2) {
             int c_control = 0;
@@ -446,7 +782,7 @@ int jit_debug_asm_dump(char *out, int out_max) {
             uint32_t c_step = jit_debug_step_target_compressed(cur_pc, (uint16_t)cur_insn,
                                                                jit_debug_last.regs, &c_control, &c_target);
             if (c_control) {
-                snprintf(control_info, sizeof(control_info), "C-CTRL target=0x%x(%s) next=0x%x si->0x%x(%s)\n",
+                snprintf(control_info, sizeof(control_info), "; target=0x%x(%s) next=0x%x stop=0x%x(%s)\n",
                          c_target, jit_debug_addr_class(c_target), cur_pc + 2,
                          c_step, jit_debug_addr_class(c_step));
             }
@@ -455,23 +791,67 @@ int jit_debug_asm_dump(char *out, int out_max) {
             int32_t imm = jit_debug_sext(((cur_insn >> 31) << 20) | (((cur_insn >> 12) & 0xff) << 12) |
                                          (((cur_insn >> 20) & 1) << 11) | (((cur_insn >> 21) & 0x3ff) << 1), 21);
             uint32_t target = cur_pc + imm;
-            uint32_t step = (rd != 0 && !jit_debug_addr_in_code(target)) ? cur_pc + 4 : target;
+            int external = 0;
+            uint32_t step = jit_debug_single_step_pc(cur_pc, target, rd, &external);
             snprintf(control_info, sizeof(control_info),
-                     "JAL %s target=0x%x next=0x%x si->0x%x %s\n",
-                     jit_debug_addr_class(target), target, cur_pc + 4, step,
-                     (rd != 0 && !jit_debug_addr_in_code(target)) ? "step-over external call" : "step-into");
+                     "; target=0x%x(%s) next=0x%x stop=0x%x %s\n",
+                     target, jit_debug_addr_class(target), cur_pc + 4, step,
+                     external ? "step-over external call until return" : "step-into");
+        } else if (op == 0x17) {
+            int rd = (cur_insn >> 7) & 31;
+            int32_t hi20 = (int32_t)(cur_insn & 0xfffff000u);
+            uint32_t base = cur_pc + (uint32_t)hi20;
+            uint32_t next_pc = cur_pc + 4;
+            if (jit_debug_addr_stepable(next_pc) && jit_debug_insn_len(next_pc) == 4) {
+                uint32_t next_insn = jit_debug_read_insn(next_pc);
+                uint32_t next_op = next_insn & 0x7fu;
+                int next_rs1 = (next_insn >> 15) & 31;
+                if (next_op == 0x67 && next_rs1 == rd) {
+                    int32_t lo12 = jit_debug_sext(next_insn >> 20, 12);
+                    int next_rd = (next_insn >> 7) & 31;
+                    uint32_t target = (base + (uint32_t)lo12) & ~1u;
+                    uint32_t stop = jit_debug_single_step_pc(next_pc, target, next_rd, 0);
+                    snprintf(control_info, sizeof(control_info),
+                             "; auipc/jalr target=0x%x(%s) base=0x%x lo=%d stop=0x%x\n",
+                             target, jit_debug_addr_class(target), base, lo12, stop);
+                } else if (next_op == 0x03 && ((next_insn >> 12) & 7u) == 2u &&
+                           ((next_insn >> 7) & 31) == rd && next_rs1 == rd &&
+                           jit_debug_addr_stepable(cur_pc + 8) && jit_debug_insn_len(cur_pc + 8) == 4) {
+                    uint32_t jalr_insn = jit_debug_read_insn(cur_pc + 8);
+                    int jalr_rs1 = (jalr_insn >> 15) & 31;
+                    if ((jalr_insn & 0x7fu) == 0x67 && jalr_rs1 == rd) {
+                        int32_t load_lo = jit_debug_sext(next_insn >> 20, 12);
+                        int32_t jalr_lo = jit_debug_sext(jalr_insn >> 20, 12);
+                        uint32_t got_addr = base + (uint32_t)load_lo;
+                        uint32_t target = (*(volatile uint32_t *)(uintptr_t)got_addr + (uint32_t)jalr_lo) & ~1u;
+                        int jalr_rd = (jalr_insn >> 7) & 31;
+                        uint32_t stop = jit_debug_single_step_pc(cur_pc + 8, target, jalr_rd, 0);
+                        snprintf(control_info, sizeof(control_info),
+                                 "; auipc/lw/jalr got=0x%x target=0x%x(%s) stop=0x%x\n",
+                                 got_addr, target, jit_debug_addr_class(target), stop);
+                    }
+                }
+            }
         } else if (op == 0x67) {
             int rd = (cur_insn >> 7) & 31;
             int rs1 = (cur_insn >> 15) & 31;
             int32_t imm = jit_debug_sext(cur_insn >> 20, 12);
             uint32_t base = jit_debug_reg_value(jit_debug_last.regs, rs1);
             uint32_t target = (base + imm) & ~1u;
-            uint32_t step = (rd != 0 && !jit_debug_addr_in_code(target)) ? cur_pc + 4 : target;
-            snprintf(control_info, sizeof(control_info),
-                     "JALR %s base=%s=0x%x imm=%d target=0x%x next=0x%x si->0x%x %s\n",
-                     jit_debug_addr_class(target), jit_debug_reg_name(rs1), base, imm,
-                     target, cur_pc + 4, step,
-                     (rd != 0 && !jit_debug_addr_in_code(target)) ? "step-over external call" : "step-into");
+            int external = 0;
+            uint32_t step = jit_debug_single_step_pc(cur_pc, target, rd, &external);
+            if (rd == 0 && rs1 == 1 && imm == 0) {
+                snprintf(control_info, sizeof(control_info),
+                         "; ra=0x%x(%s) next=0x%x stop=0x%x(%s)\n",
+                         target, jit_debug_addr_class(target), cur_pc + 4,
+                         step, jit_debug_addr_class(step));
+            } else {
+                snprintf(control_info, sizeof(control_info),
+                         "; base=%s=0x%x imm=%d target=0x%x(%s) next=0x%x stop=0x%x %s\n",
+                         jit_debug_reg_name(rs1), base, imm,
+                         target, jit_debug_addr_class(target), cur_pc + 4, step,
+                         external ? "step-over external call until return" : "step-into");
+            }
         } else if (op == 0x63) {
             int rs1 = (cur_insn >> 15) & 31;
             int rs2 = (cur_insn >> 20) & 31;
@@ -479,7 +859,7 @@ int jit_debug_asm_dump(char *out, int out_max) {
             uint32_t v2 = jit_debug_reg_value(jit_debug_last.regs, rs2);
             int32_t imm = jit_debug_sext(((cur_insn >> 31) << 12) | (((cur_insn >> 7) & 1) << 11) |
                                          (((cur_insn >> 25) & 0x3f) << 5) | (((cur_insn >> 8) & 0xf) << 1), 13);
-            snprintf(control_info, sizeof(control_info), "BR %s=0x%x %s=0x%x %s target=0x%x(%s) fallthrough=0x%x si->0x%x\n",
+            snprintf(control_info, sizeof(control_info), "; %s=0x%x %s=0x%x %s target=0x%x(%s) fallthrough=0x%x stop=0x%x\n",
                      jit_debug_reg_name(rs1), v1,
                      jit_debug_reg_name(rs2), v2,
                      jit_debug_branch_taken(cur_insn, jit_debug_last.regs) ? "taken" : "fallthrough",
@@ -489,38 +869,57 @@ int jit_debug_asm_dump(char *out, int out_max) {
     }
     dbg_append(out, out_max, "=> = current pc; source line is last probe\n");
 
-    for (int i = 5; i >= 1; i--) {
-        uint32_t addr = pc - (uint32_t)i * 4u;
-        uint32_t insn;
-        if (addr > pc || !jit_debug_addr_in_code(addr)) {
-            dbg_append(out, out_max, "~\n");
-            continue;
+    {
+        uint32_t prev[5];
+        int prev_count = 0;
+        uint32_t scan = jit_debug_code_lo ? jit_debug_code_lo : pc;
+        while (scan < pc && jit_debug_addr_stepable(scan)) {
+            int len = jit_debug_insn_len(scan);
+            if (len != 2 && len != 4) break;
+            prev[prev_count % 5] = scan;
+            prev_count++;
+            scan += (uint32_t)len;
         }
-        insn = *(volatile uint32_t *)(uintptr_t)addr;
-        if (insn == 0x00100073) {
-            dbg_append(out, out_max, "~\n");
-            continue;
+        for (int i = 5; i >= 1; i--) {
+            int idx = prev_count - i;
+            uint32_t addr;
+            uint32_t insn;
+            if (idx < 0) {
+                dbg_append(out, out_max, "~\n");
+                continue;
+            }
+            addr = prev[idx % 5];
+            if (!jit_debug_addr_stepable(addr)) {
+                dbg_append(out, out_max, "~\n");
+                continue;
+            }
+            insn = jit_debug_read_insn(addr);
+            if (insn == 0x00100073) {
+                dbg_append(out, out_max, "~\n");
+                continue;
+            }
+            jit_debug_hex8(hpc, addr);
+            jit_debug_format_insn(addr, insn, insn_text, sizeof(insn_text));
+            snprintf(row, sizeof(row), "   0x%s  %s\n", hpc, insn_text);
+            dbg_append(out, out_max, row);
         }
-        jit_debug_hex8(hpc, addr);
-        jit_debug_format_insn(addr, insn, insn_text, sizeof(insn_text));
-        snprintf(row, sizeof(row), "   0x%s  %s\n", hpc, insn_text);
-        dbg_append(out, out_max, row);
     }
     {
-        uint32_t insn = *(volatile uint32_t *)(uintptr_t)pc;
+        uint32_t insn = jit_debug_read_insn(pc);
         jit_debug_hex8(hpc, pc);
         jit_debug_format_insn(pc, insn, insn_text, sizeof(insn_text));
         snprintf(row, sizeof(row), "=> 0x%s  %s\n", hpc, insn_text);
         dbg_append(out, out_max, row);
     }
+    {
+        uint32_t addr = pc + (uint32_t)jit_debug_insn_len(pc);
     for (int i = 1; i <= 10; i++) {
-        uint32_t addr = pc + (uint32_t)i * 4u;
         uint32_t insn;
-        if (!jit_debug_addr_in_code(addr)) {
+        if (!jit_debug_addr_stepable(addr)) {
             dbg_append(out, out_max, "~\n");
             continue;
         }
-        insn = *(volatile uint32_t *)(uintptr_t)addr;
+        insn = jit_debug_read_insn(addr);
         if (insn == 0x00100073) {
             dbg_append(out, out_max, "~\n");
             continue;
@@ -529,6 +928,8 @@ int jit_debug_asm_dump(char *out, int out_max) {
         jit_debug_format_insn(addr, insn, insn_text, sizeof(insn_text));
         snprintf(row, sizeof(row), "   0x%s  %s\n", hpc, insn_text);
         dbg_append(out, out_max, row);
+        addr += (uint32_t)jit_debug_insn_len(addr);
+    }
     }
     if (control_info[0]) dbg_append(out, out_max, control_info);
     return 0;
@@ -607,14 +1008,18 @@ static void jit_debug_format_watch_dump(char *out, int out_max) {
     }
 }
 
-static void jit_debug_format_snapshot(char *out, int out_max, reg_t epc, const reg_t *r) {
+static void jit_debug_format_snapshot(char *out, int out_max,
+                                      const char *title,
+                                      reg_t epc, const reg_t *r,
+                                      reg_t cmp_epc, const reg_t *cmp_r,
+                                      int have_cmp) {
     char row[192];
-    const reg_t *pr = jit_debug_last.prev_regs;
-    int hp = jit_debug_last.have_prev;
+    int hp = have_cmp && cmp_r;
     if (!out || out_max <= 0 || !r) return;
     out[0] = '\0';
-    snprintf(row, sizeof(row), "JIT debug snapshot\n%c pc=%x\n",
-             (hp && jit_debug_last.prev_epc != epc) ? '!' : ' ',
+    snprintf(row, sizeof(row), "%s\n%c pc=%x\n",
+             title ? title : "JIT debug snapshot",
+             (hp && cmp_epc != epc) ? '!' : ' ',
              (uint32_t)epc);
     dbg_append(out, out_max, row);
     if (jit_debug_last.file[0] || jit_debug_last.line > 0) {
@@ -623,26 +1028,31 @@ static void jit_debug_format_snapshot(char *out, int out_max, reg_t epc, const r
                  jit_debug_last.line);
         dbg_append(out, out_max, row);
     }
-    jit_debug_append_reg_pair(out, out_max, 0, "zero", 0u, 0, 1, "ra", (uint32_t)r[0], hp && pr[0] != r[0]);
-    jit_debug_append_reg_pair(out, out_max, 2, "sp", (uint32_t)r[1], hp && pr[1] != r[1], 3, "gp", (uint32_t)r[2], hp && pr[2] != r[2]);
-    jit_debug_append_reg_pair(out, out_max, 4, "tp", (uint32_t)r[3], hp && pr[3] != r[3], 5, "t0", (uint32_t)r[4], hp && pr[4] != r[4]);
-    jit_debug_append_reg_pair(out, out_max, 6, "t1", (uint32_t)r[5], hp && pr[5] != r[5], 7, "t2", (uint32_t)r[6], hp && pr[6] != r[6]);
-    jit_debug_append_reg_pair(out, out_max, 8, "s0", (uint32_t)r[7], hp && pr[7] != r[7], 9, "s1", (uint32_t)r[8], hp && pr[8] != r[8]);
-    jit_debug_append_reg_pair(out, out_max, 10, "a0", (uint32_t)r[9], hp && pr[9] != r[9], 11, "a1", (uint32_t)r[10], hp && pr[10] != r[10]);
-    jit_debug_append_reg_pair(out, out_max, 12, "a2", (uint32_t)r[11], hp && pr[11] != r[11], 13, "a3", (uint32_t)r[12], hp && pr[12] != r[12]);
-    jit_debug_append_reg_pair(out, out_max, 14, "a4", (uint32_t)r[13], hp && pr[13] != r[13], 15, "a5", (uint32_t)r[14], hp && pr[14] != r[14]);
-    jit_debug_append_reg_pair(out, out_max, 16, "a6", (uint32_t)r[15], hp && pr[15] != r[15], 17, "a7", (uint32_t)r[16], hp && pr[16] != r[16]);
-    jit_debug_append_reg_pair(out, out_max, 18, "s2", (uint32_t)r[17], hp && pr[17] != r[17], 19, "s3", (uint32_t)r[18], hp && pr[18] != r[18]);
-    jit_debug_append_reg_pair(out, out_max, 20, "s4", (uint32_t)r[19], hp && pr[19] != r[19], 21, "s5", (uint32_t)r[20], hp && pr[20] != r[20]);
-    jit_debug_append_reg_pair(out, out_max, 22, "s6", (uint32_t)r[21], hp && pr[21] != r[21], 23, "s7", (uint32_t)r[22], hp && pr[22] != r[22]);
-    jit_debug_append_reg_pair(out, out_max, 24, "s8", (uint32_t)r[23], hp && pr[23] != r[23], 25, "s9", (uint32_t)r[24], hp && pr[24] != r[24]);
-    jit_debug_append_reg_pair(out, out_max, 26, "s10", (uint32_t)r[25], hp && pr[25] != r[25], 27, "s11", (uint32_t)r[26], hp && pr[26] != r[26]);
-    jit_debug_append_reg_pair(out, out_max, 28, "t3", (uint32_t)r[27], hp && pr[27] != r[27], 29, "t4", (uint32_t)r[28], hp && pr[28] != r[28]);
-    jit_debug_append_reg_pair(out, out_max, 30, "t5", (uint32_t)r[29], hp && pr[29] != r[29], 31, "t6", (uint32_t)r[30], hp && pr[30] != r[30]);
+    jit_debug_append_reg_pair(out, out_max, 0, "zero", 0u, 0, 1, "ra", (uint32_t)r[0], hp && cmp_r[0] != r[0]);
+    jit_debug_append_reg_pair(out, out_max, 2, "sp", (uint32_t)r[1], hp && cmp_r[1] != r[1], 3, "gp", (uint32_t)r[2], hp && cmp_r[2] != r[2]);
+    jit_debug_append_reg_pair(out, out_max, 4, "tp", (uint32_t)r[3], hp && cmp_r[3] != r[3], 5, "t0", (uint32_t)r[4], hp && cmp_r[4] != r[4]);
+    jit_debug_append_reg_pair(out, out_max, 6, "t1", (uint32_t)r[5], hp && cmp_r[5] != r[5], 7, "t2", (uint32_t)r[6], hp && cmp_r[6] != r[6]);
+    jit_debug_append_reg_pair(out, out_max, 8, "s0", (uint32_t)r[7], hp && cmp_r[7] != r[7], 9, "s1", (uint32_t)r[8], hp && cmp_r[8] != r[8]);
+    jit_debug_append_reg_pair(out, out_max, 10, "a0", (uint32_t)r[9], hp && cmp_r[9] != r[9], 11, "a1", (uint32_t)r[10], hp && cmp_r[10] != r[10]);
+    jit_debug_append_reg_pair(out, out_max, 12, "a2", (uint32_t)r[11], hp && cmp_r[11] != r[11], 13, "a3", (uint32_t)r[12], hp && cmp_r[12] != r[12]);
+    jit_debug_append_reg_pair(out, out_max, 14, "a4", (uint32_t)r[13], hp && cmp_r[13] != r[13], 15, "a5", (uint32_t)r[14], hp && cmp_r[14] != r[14]);
+    jit_debug_append_reg_pair(out, out_max, 16, "a6", (uint32_t)r[15], hp && cmp_r[15] != r[15], 17, "a7", (uint32_t)r[16], hp && cmp_r[16] != r[16]);
+    jit_debug_append_reg_pair(out, out_max, 18, "s2", (uint32_t)r[17], hp && cmp_r[17] != r[17], 19, "s3", (uint32_t)r[18], hp && cmp_r[18] != r[18]);
+    jit_debug_append_reg_pair(out, out_max, 20, "s4", (uint32_t)r[19], hp && cmp_r[19] != r[19], 21, "s5", (uint32_t)r[20], hp && cmp_r[20] != r[20]);
+    jit_debug_append_reg_pair(out, out_max, 22, "s6", (uint32_t)r[21], hp && cmp_r[21] != r[21], 23, "s7", (uint32_t)r[22], hp && cmp_r[22] != r[22]);
+    jit_debug_append_reg_pair(out, out_max, 24, "s8", (uint32_t)r[23], hp && cmp_r[23] != r[23], 25, "s9", (uint32_t)r[24], hp && cmp_r[24] != r[24]);
+    jit_debug_append_reg_pair(out, out_max, 26, "s10", (uint32_t)r[25], hp && cmp_r[25] != r[25], 27, "s11", (uint32_t)r[26], hp && cmp_r[26] != r[26]);
+    jit_debug_append_reg_pair(out, out_max, 28, "t3", (uint32_t)r[27], hp && cmp_r[27] != r[27], 29, "t4", (uint32_t)r[28], hp && cmp_r[28] != r[28]);
+    jit_debug_append_reg_pair(out, out_max, 30, "t5", (uint32_t)r[29], hp && cmp_r[29] != r[29], 31, "t6", (uint32_t)r[30], hp && cmp_r[30] != r[30]);
 }
 
 static void jit_debug_capture_break(reg_t pc, reg_t frame) {
     reg_t *r = (reg_t *)frame;
+    reg_t display_pc = pc;
+    if (!jit_debug_addr_stepable((uint32_t)pc) &&
+        jit_debug_addr_stepable(jit_debug_probe_pc)) {
+        display_pc = (reg_t)jit_debug_probe_pc;
+    }
     if (jit_debug_last.valid) {
         jit_debug_last.prev_epc = jit_debug_last.epc;
         for (int i = 0; i < 31; i++) jit_debug_last.prev_regs[i] = jit_debug_last.regs[i];
@@ -653,12 +1063,13 @@ static void jit_debug_capture_break(reg_t pc, reg_t frame) {
     jit_debug_last.valid = 1;
     jit_debug_last.paused = 1;
     jit_debug_last.task_id = task_current();
-    jit_debug_last.epc = pc;
+    jit_debug_last.epc = display_pc;
     for (int i = 0; i < 31; i++) {
         jit_debug_last.regs[i] = r[i];
         jit_debug_saved_frame[i] = r[i];
     }
-    jit_debug_apply_line_map((uint32_t)pc);
+    jit_debug_apply_line_map((uint32_t)display_pc);
+    gui_redraw_needed = 1;
 }
 
 static void jit_debug_flush_icache(void) {
@@ -683,6 +1094,8 @@ static void jit_debug_update_last(reg_t pc, const reg_t *r) {
     jit_debug_last.epc = pc;
     for (int i = 0; i < 31; i++) jit_debug_last.regs[i] = r[i];
     jit_debug_last.valid = 1;
+    jit_debug_apply_line_map((uint32_t)pc);
+    gui_redraw_needed = 1;
 }
 
 void jit_debug_set_code_range(uint32_t lo, uint32_t hi) {
@@ -694,13 +1107,11 @@ static int jit_debug_addr_in_code(uint32_t addr) {
     if (jit_debug_code_lo && jit_debug_code_hi) {
         if (addr >= jit_debug_code_lo && addr < jit_debug_code_hi) return 1;
     }
-    // Default to kernel text range
-    uint32_t ts = (uint32_t)(uintptr_t)&_text_start;
-    uint32_t te = (uint32_t)(uintptr_t)&_text_end;
-    if (addr >= ts && addr < te) return 1;
-    // Fallback/Legacy range
-    if (addr >= 0x85000000u && addr < 0x88000000u) return 1;
     return 0;
+}
+
+static int jit_debug_addr_stepable(uint32_t addr) {
+    return jit_debug_addr_in_code(addr);
 }
 
 static void jit_debug_restore_temp_breaks(void) {
@@ -727,13 +1138,35 @@ static int jit_debug_temp_break_hit(uint32_t epc) {
     return 0;
 }
 
+static uint32_t jit_debug_temp_break_orig(uint32_t epc) {
+    for (int i = 0; i < 2; i++) {
+        if (jit_debug_temp_breaks[i].active && jit_debug_temp_breaks[i].addr == epc) {
+            return jit_debug_temp_breaks[i].orig;
+        }
+    }
+    return 0;
+}
+
 static void jit_debug_add_temp_break(uint32_t addr) {
     int len;
-    if (!jit_debug_addr_in_code(addr)) return;
+    if (!jit_debug_addr_stepable(addr)) return;
     for (int i = 0; i < 2; i++) {
         if (jit_debug_temp_breaks[i].active && jit_debug_temp_breaks[i].addr == addr) return;
     }
     len = jit_debug_insn_len(addr);
+    if (len == 2) {
+        uint16_t h = *(volatile uint16_t *)(uintptr_t)addr;
+        if (!jit_debug_c_insn_valid(h)) {
+            lib_printf("[JITDBG] temp reject invalid-c addr=%x h=%x\n", addr, (uint32_t)h);
+            return;
+        }
+    } else {
+        uint32_t word = *(volatile uint32_t *)(uintptr_t)addr;
+        if (!jit_debug_insn_is_rv32_word(word)) {
+            lib_printf("[JITDBG] temp reject invalid-rv32 addr=%x word=%x\n", addr, word);
+            return;
+        }
+    }
     for (int i = 0; i < 2; i++) {
         if (jit_debug_temp_breaks[i].active) continue;
         jit_debug_temp_breaks[i].addr = addr;
@@ -746,14 +1179,17 @@ static void jit_debug_add_temp_break(uint32_t addr) {
             *(volatile uint32_t *)(uintptr_t)addr = 0x00100073;
         }
         jit_debug_temp_breaks[i].active = 1;
+        lib_printf("[JITDBG] temp set slot=%d addr=%x len=%d orig=%x\n",
+                   i, addr, len, jit_debug_temp_breaks[i].orig);
         return;
     }
+    lib_printf("[JITDBG] temp table full addr=%x\n", addr);
 }
 
 static int jit_debug_install_single_step_breaks(char *out, int out_max) {
     uint32_t pc = (uint32_t)jit_debug_last.epc;
     uint32_t insn;
-    uint32_t op;
+    uint32_t op = 0;
     int insn_len;
     uint32_t next;
     uint32_t target = 0;
@@ -765,17 +1201,33 @@ static int jit_debug_install_single_step_breaks(char *out, int out_max) {
 
     if (!pc) return -1;
     jit_debug_restore_temp_breaks();
-    if (!jit_debug_addr_in_code(pc)) {
-        if (out && out_max > 0) snprintf(out, out_max, "JIT debug: si outside jit text.");
+    if (!jit_debug_addr_stepable(pc)) {
+        if (out && out_max > 0) snprintf(out, out_max, "JIT debug: si outside step text.");
         return -1;
     }
     insn_len = jit_debug_insn_len(pc);
     next = pc + (uint32_t)insn_len;
+    lib_printf("[JITDBG] si begin pc=%x len=%d class=%s jit=%x..%x\n",
+               pc, insn_len, jit_debug_addr_class(pc), jit_debug_code_lo, jit_debug_code_hi);
     if (insn_len == 2) {
         uint16_t h = *(volatile uint16_t *)(uintptr_t)pc;
         insn = h;
+        if (!jit_debug_c_insn_valid(h)) {
+            if (out && out_max > 0) {
+                snprintf(out, out_max, "si invalid c pc=%x h=%x", pc, (uint32_t)h);
+            }
+            lib_printf("[JITDBG] si invalid c pc=%x h=%x\n", pc, (uint32_t)h);
+            return -1;
+        }
         step_pc = jit_debug_step_target_compressed(pc, h, r, &is_control, &target);
         has_target = is_control && target != 0;
+        if (is_control && step_pc == pc) {
+            if (out && out_max > 0) {
+                snprintf(out, out_max, "si self-loop c pc=%x insn=%x", pc, insn);
+            }
+            lib_printf("[JITDBG] si self-loop c pc=%x insn=%x\n", pc, insn);
+            return -1;
+        }
         
         // For compressed branches, try to set breaks on both paths
         uint32_t funct3 = (h >> 13) & 7u;
@@ -783,13 +1235,28 @@ static int jit_debug_install_single_step_breaks(char *out, int out_max) {
         if (cop == 1u && (funct3 == 6u || funct3 == 7u)) {
             // It's a c.beqz or c.bnez
             uint32_t b_target = pc + jit_debug_cb_imm(h);
-            if (jit_debug_addr_in_code(b_target)) jit_debug_add_temp_break(b_target);
-            if (jit_debug_addr_in_code(next)) jit_debug_add_temp_break(next);
+            if (jit_debug_addr_stepable(b_target)) jit_debug_add_temp_break(b_target);
+            if (jit_debug_addr_stepable(next)) jit_debug_add_temp_break(next);
+            if (!jit_debug_temp_breaks[0].active && !jit_debug_temp_breaks[1].active) {
+                if (out && out_max > 0) snprintf(out, out_max, "JIT debug: si branch target invalid.");
+                return -1;
+            }
+            jit_debug_flush_icache();
+            if (out && out_max > 0) {
+                snprintf(out, out_max, "si c-branch pc=%x insn=%x next=%x target=%x(%s) tb0=%x tb1=%x",
+                         pc, insn, next, b_target, jit_debug_addr_class(b_target),
+                         jit_debug_temp_breaks[0].active ? jit_debug_temp_breaks[0].addr : 0,
+                         jit_debug_temp_breaks[1].active ? jit_debug_temp_breaks[1].addr : 0);
+            }
+            lib_printf("[JITDBG] si c-branch armed pc=%x insn=%x next=%x target=%x(%s) tb0=%x tb1=%x\n",
+                       pc, insn, next, b_target, jit_debug_addr_class(b_target),
+                       jit_debug_temp_breaks[0].active ? jit_debug_temp_breaks[0].addr : 0,
+                       jit_debug_temp_breaks[1].active ? jit_debug_temp_breaks[1].addr : 0);
             jit_debug_update_last(pc, r);
             return 0;
         }
 
-        if (step_pc && !jit_debug_addr_in_code(step_pc)) {
+        if (step_pc && !jit_debug_addr_stepable(step_pc)) {
             if (has_target && step_pc == target) {
                 if (out && out_max > 0) {
                     snprintf(out, out_max, "si c-out: pc=%x insn=%x target=%x(%s)",
@@ -802,7 +1269,21 @@ static int jit_debug_install_single_step_breaks(char *out, int out_max) {
         goto install_breaks;
     }
     insn = *(volatile uint32_t *)(uintptr_t)pc;
+    if (!jit_debug_insn_is_rv32_word(insn)) {
+        if (out && out_max > 0) {
+            snprintf(out, out_max, "si invalid/padding pc=%x word=%x", pc, insn);
+        }
+        lib_printf("[JITDBG] si invalid/padding pc=%x word=%x\n", pc, insn);
+        return -1;
+    }
     op = insn & 0x7f;
+    if (jit_debug_rv32_bare_mem_fault(insn)) {
+        if (out && out_max > 0) {
+            snprintf(out, out_max, "si suspect bare mem pc=%x insn=%x", pc, insn);
+        }
+        lib_printf("[JITDBG] si suspect bare mem pc=%x insn=%x\n", pc, insn);
+        return -1;
+    }
     if (op == 0x6f) {
         int rd = (insn >> 7) & 31;
         int32_t imm = jit_debug_sext(((insn >> 31) << 20) | (((insn >> 12) & 0xff) << 12) |
@@ -810,15 +1291,21 @@ static int jit_debug_install_single_step_breaks(char *out, int out_max) {
         target = pc + imm;
         has_target = 1;
         is_control = 1;
-        if (jit_debug_addr_in_code(target)) {
-            step_pc = target;
-        } else if (rd != 0) {
-            // Function call out of range, step to next
-            step_pc = next;
-        } else {
-            // Jump out of range
-            if (out && out_max > 0) snprintf(out, out_max, "si j-out: pc=%x target=%x", pc, target);
+        if (target == pc) {
+            if (out && out_max > 0) {
+                snprintf(out, out_max, "si self-loop jal pc=%x insn=%x next=%x", pc, insn, next);
+            }
+            lib_printf("[JITDBG] si self-loop jal pc=%x insn=%x next=%x\n", pc, insn, next);
             return -1;
+        }
+        if (!rd) {
+            if (!jit_debug_addr_stepable(target)) {
+                if (out && out_max > 0) snprintf(out, out_max, "si j-out: pc=%x target=%x", pc, target);
+                return -1;
+            }
+            step_pc = target;
+        } else {
+            step_pc = jit_debug_single_step_pc(pc, target, rd, 0);
         }
     } else if (op == 0x67) {
         int rd = (insn >> 7) & 31;
@@ -827,28 +1314,58 @@ static int jit_debug_install_single_step_breaks(char *out, int out_max) {
         target = (jit_debug_reg_value(r, rs1) + imm) & ~1u;
         has_target = 1;
         is_control = 1;
-        if (jit_debug_addr_in_code(target)) {
-            step_pc = target;
-        } else if (rd != 0) {
-            step_pc = next;
-        } else {
-            if (out && out_max > 0) snprintf(out, out_max, "si jr-out: pc=%x target=%x", pc, target);
+        if (target == pc) {
+            if (out && out_max > 0) {
+                snprintf(out, out_max, "si self-loop jalr pc=%x insn=%x next=%x", pc, insn, next);
+            }
+            lib_printf("[JITDBG] si self-loop jalr pc=%x insn=%x next=%x\n", pc, insn, next);
             return -1;
+        }
+        if (!rd) {
+            if (!jit_debug_addr_stepable(target)) {
+                if (out && out_max > 0) snprintf(out, out_max, "si jr-out: pc=%x target=%x", pc, target);
+                return -1;
+            }
+            step_pc = target;
+        } else {
+            step_pc = jit_debug_single_step_pc(pc, target, rd, 0);
         }
     } else if (op == 0x63) {
         int32_t imm = jit_debug_sext(((insn >> 31) << 12) | (((insn >> 7) & 1) << 11) |
                                      (((insn >> 25) & 0x3f) << 5) | (((insn >> 8) & 0xf) << 1), 13);
         target = pc + imm;
+        if (target == pc && jit_debug_branch_taken(insn, r)) {
+            if (out && out_max > 0) {
+                snprintf(out, out_max, "si self-loop branch pc=%x insn=%x next=%x", pc, insn, next);
+            }
+            lib_printf("[JITDBG] si self-loop branch pc=%x insn=%x next=%x\n", pc, insn, next);
+            return -1;
+        }
         // For branches, set breaks on BOTH paths to be safe
-        if (jit_debug_addr_in_code(target)) jit_debug_add_temp_break(target);
-        if (jit_debug_addr_in_code(next)) jit_debug_add_temp_break(next);
+        if (jit_debug_addr_stepable(target)) jit_debug_add_temp_break(target);
+        if (jit_debug_addr_stepable(next)) jit_debug_add_temp_break(next);
+        if (!jit_debug_temp_breaks[0].active && !jit_debug_temp_breaks[1].active) {
+            if (out && out_max > 0) snprintf(out, out_max, "JIT debug: si branch target invalid.");
+            return -1;
+        }
+        jit_debug_flush_icache();
+        if (out && out_max > 0) {
+            snprintf(out, out_max, "si branch pc=%x insn=%x next=%x target=%x(%s) tb0=%x tb1=%x",
+                     pc, insn, next, target, jit_debug_addr_class(target),
+                     jit_debug_temp_breaks[0].active ? jit_debug_temp_breaks[0].addr : 0,
+                     jit_debug_temp_breaks[1].active ? jit_debug_temp_breaks[1].addr : 0);
+        }
+        lib_printf("[JITDBG] si branch armed pc=%x insn=%x next=%x target=%x(%s) tb0=%x tb1=%x\n",
+                   pc, insn, next, target, jit_debug_addr_class(target),
+                   jit_debug_temp_breaks[0].active ? jit_debug_temp_breaks[0].addr : 0,
+                   jit_debug_temp_breaks[1].active ? jit_debug_temp_breaks[1].addr : 0);
         jit_debug_update_last(pc, r); // Ensure UI updates before CPU continues
         return 0;
     } else {
         step_pc = next;
     }
 
-    if (step_pc && !jit_debug_addr_in_code(step_pc)) {
+    if (step_pc && !jit_debug_addr_stepable(step_pc)) {
         if (out && out_max > 0) {
             snprintf(out, out_max, "si step out: pc=%x step=%x", pc, step_pc);
         }
@@ -860,7 +1377,7 @@ install_breaks:
         jit_debug_add_temp_break(step_pc);
     } else {
         jit_debug_add_temp_break(next);
-        if (has_target && jit_debug_addr_in_code(target)) jit_debug_add_temp_break(target);
+        if (has_target && jit_debug_addr_stepable(target)) jit_debug_add_temp_break(target);
     }
     if (!jit_debug_temp_breaks[0].active && !jit_debug_temp_breaks[1].active) {
         if (out && out_max > 0) snprintf(out, out_max, "JIT debug: si target invalid.");
@@ -871,6 +1388,22 @@ install_breaks:
         snprintf(out, out_max, "si pc=%x insn=%x next=%x target=%x(%s) step=%x(%s)",
                  pc, insn, next, target, jit_debug_addr_class(target),
                  step_pc ? step_pc : next, jit_debug_addr_class(step_pc ? step_pc : next));
+    }
+    lib_printf("[JITDBG] si armed pc=%x insn=%x next=%x target=%x(%s) step=%x(%s) tb0=%x tb1=%x\n",
+               pc, insn, next, target, jit_debug_addr_class(target),
+               step_pc ? step_pc : next, jit_debug_addr_class(step_pc ? step_pc : next),
+               jit_debug_temp_breaks[0].active ? jit_debug_temp_breaks[0].addr : 0,
+               jit_debug_temp_breaks[1].active ? jit_debug_temp_breaks[1].addr : 0);
+    if (insn_len == 4 && op == 0x67) {
+        int rd = (insn >> 7) & 31;
+        int rs1 = (insn >> 15) & 31;
+        int32_t imm = jit_debug_sext(insn >> 20, 12);
+        uint32_t base = jit_debug_reg_value(r, rs1);
+        lib_printf("[JITDBG] si jalr detail rd=%s rs1=%s base=%x imm=%d actual=%x(%s) stop=%x(%s) mode=%s\n",
+                   jit_debug_reg_name(rd), jit_debug_reg_name(rs1), base, imm,
+                   target, jit_debug_addr_class(target),
+                   step_pc ? step_pc : next, jit_debug_addr_class(step_pc ? step_pc : next),
+                   (rd != 0 && !jit_debug_addr_stepable(target)) ? "step-over-external" : "step-into");
     }
     return 0;
 }
@@ -887,17 +1420,17 @@ void jit_debug_set_line(int line) {
 void jit_debug_set_location(const char *file, int line) {
     if (line < 0) line = 0;
     jit_debug_last.line = line;
+    if (jit_debug_file_is_synthetic(file)) return;
     if (!file) file = "";
     strncpy(jit_debug_last.file, file, sizeof(jit_debug_last.file) - 1);
     jit_debug_last.file[sizeof(jit_debug_last.file) - 1] = '\0';
 }
 
 void jit_debug_set_pc(uint32_t pc) {
-    jit_debug_last.epc = (reg_t)pc;
+    jit_debug_probe_pc = pc;
 }
 
 int jit_debug_probe(const char *file, int line) {
-    jit_debug_set_location(file, line);
     if (jit_debug_last.step_once) {
         jit_debug_last.step_once = 0;
         return 1;
@@ -913,9 +1446,14 @@ void jit_debug_begin(void) {
     jit_debug_last.paused = 0;
     jit_debug_last.task_id = -1;
     jit_debug_last.line = 0;
+    jit_debug_last.column = 0;
+    jit_debug_last.discriminator = 0;
+    jit_debug_last.line_flags = 0;
+    jit_debug_last.line_isa = 0;
     jit_debug_last.epc = 0;
     jit_debug_last.file[0] = '\0';
     jit_debug_last.step_once = 1;
+    jit_debug_probe_pc = 0;
 }
 
 int jit_debug_set_watch(uint32_t addr, uint32_t len, char *out, int out_max) {
@@ -936,8 +1474,6 @@ void jit_watch_access(uint32_t addr, uint32_t size, int is_store) {
     uint32_t wlen = jit_debug_last.watch_len;
     uint32_t w1;
     uint32_t a1;
-    extern volatile int gui_redraw_needed;
-
     if (!w0 || !wlen || !size) return;
     w1 = w0 + wlen;
     a1 = addr + size;
@@ -1040,7 +1576,24 @@ int jit_debug_snapshot(char *out, int out_max) {
         snprintf(out, out_max, "JIT debug: no breakpoint captured.");
         return -1;
     }
-    jit_debug_format_snapshot(out, out_max, jit_debug_last.epc, jit_debug_last.regs);
+    jit_debug_format_snapshot(out, out_max, "JIT current snapshot",
+                              jit_debug_last.epc, jit_debug_last.regs,
+                              jit_debug_last.prev_epc, jit_debug_last.prev_regs,
+                              jit_debug_last.have_prev);
+    return 0;
+}
+
+int jit_debug_snapshot_prev(char *out, int out_max) {
+    if (!out || out_max <= 0) return -1;
+    out[0] = '\0';
+    if (!jit_debug_last.valid || !jit_debug_last.have_prev) {
+        snprintf(out, out_max, "JIT debug: no previous snapshot.");
+        return -1;
+    }
+    jit_debug_format_snapshot(out, out_max, "JIT previous snapshot (p)",
+                              jit_debug_last.prev_epc, jit_debug_last.prev_regs,
+                              jit_debug_last.epc, jit_debug_last.regs,
+                              1);
     return 0;
 }
 
@@ -1131,13 +1684,25 @@ reg_t trap_handler(reg_t epc, reg_t cause, reg_t frame) {
         }
     } else if (cause_code == 3) {
         if (jit_debug_temp_break_hit((uint32_t)epc)) {
+            uint32_t tb0 = jit_debug_temp_breaks[0].active ? jit_debug_temp_breaks[0].addr : 0;
+            uint32_t tb1 = jit_debug_temp_breaks[1].active ? jit_debug_temp_breaks[1].addr : 0;
+            uint32_t orig = jit_debug_temp_break_orig((uint32_t)epc);
+            lib_printf("[JITDBG] trap temp-hit epc=%lx class=%s tb0=%x tb1=%x\n",
+                       (unsigned long)epc, jit_debug_addr_class((uint32_t)epc), tb0, tb1);
             jit_debug_restore_temp_breaks();
-            jit_debug_capture_break(epc, frame);
-            jit_debug_resume_pc = epc;
-        } else {
-            if (jit_debug_last.file[0] && jit_debug_last.line > 0) {
-                jit_debug_record_line_pc((uint32_t)(epc + 4), jit_debug_last.file, jit_debug_last.line);
+            if (orig == 0x00100073u) {
+                lib_printf("[JITDBG] trap temp-hit reused probe epc=%lx resume=%lx\n",
+                           (unsigned long)epc, (unsigned long)(epc + 4));
+                jit_debug_capture_break(epc + 4, frame);
+                jit_debug_resume_pc = epc + 4;
+            } else {
+                jit_debug_capture_break(epc, frame);
+                jit_debug_resume_pc = epc;
             }
+        } else {
+            lib_printf("[JITDBG] trap probe-hit epc=%lx resume=%lx class=%s jitpc=%x\n",
+                       (unsigned long)epc, (unsigned long)(epc + 4),
+                       jit_debug_addr_class((uint32_t)epc), jit_debug_probe_pc);
             jit_debug_capture_break(epc + 4, frame);
             jit_debug_resume_pc = epc + 4;
         }

@@ -14,6 +14,7 @@ int gui_shortcut_close_task = 0;
 int gui_shortcut_switch_task = 0; 
 int gui_ctrl_pressed = 0;
 char gui_key=0;
+int gui_prev_regs_pressed = 0;
 int gbemu_btn_a = 0;
 int gbemu_btn_b = 0;
 int gbemu_btn_start = 0;
@@ -23,6 +24,7 @@ int gbemu_btn_down = 0;
 int gbemu_btn_left = 0;
 int gbemu_btn_right = 0;
 extern int os_debug;
+extern volatile int gui_redraw_needed;
 
 struct raw_input_event {
     uint16 device;
@@ -174,6 +176,10 @@ void virtio_input_poll(void) {
                     CTRLDBG_PRINTF("[CTRLDBG] input raw-c ctrl_l=%d ctrl_r=%d any=%d\n",
                                    ctrl_l_pressed, ctrl_r_pressed, (ctrl_l_pressed || ctrl_r_pressed));
                 }
+                if (ev.code == 25) {
+                    gui_prev_regs_pressed = 1;
+                    gui_redraw_needed = 1;
+                }
                 // 特殊快捷鍵
                 if ((ctrl_l_pressed || ctrl_r_pressed) && ev.code == 15) gui_shortcut_switch_task = 1;
                 else if ((ctrl_l_pressed || ctrl_r_pressed) && ev.code == 20) gui_shortcut_new_task = 1;
@@ -213,6 +219,10 @@ void virtio_input_poll(void) {
             } 
             // 4. 處理放開 (Key Up)
             else if (ev.value == 0) {
+                if (ev.code == 25) {
+                    gui_prev_regs_pressed = 0;
+                    gui_redraw_needed = 1;
+                }
                 if (ev.code == 0x2C) gbemu_btn_a = 0;
                 if (ev.code == 0x2D) gbemu_btn_b = 0;
                 if (ev.code == 0x1C || ev.code == 0x60) gbemu_btn_start = 0;

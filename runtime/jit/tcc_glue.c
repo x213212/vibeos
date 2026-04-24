@@ -2,6 +2,19 @@
 #include "vga.h"
 #include "timer.h"
 #include "libtcc.h"
+#include "tcc.h"
+#undef free
+#undef malloc
+#undef realloc
+#undef stab_section
+#undef stabstr_section
+#undef tcov_section
+#undef dwarf_info_section
+#undef dwarf_abbrev_section
+#undef dwarf_line_section
+#undef dwarf_aranges_section
+#undef dwarf_str_section
+#undef dwarf_line_str_section
 #include "setjmp.h"
 #include "unistd.h"
 #include "sys/time.h"
@@ -10,18 +23,19 @@
 // --- 使用核心現有的符號 (由 user_utils.c 提供) ---
 extern void *realloc(void *ptr, size_t size);
 extern void *calloc(uint32_t nmemb, uint32_t size);
-extern int fflush(void *stream);
+extern int fflush(FILE *stream);
 extern int puts(const char *s);
 extern char *strcpy(char *dst, const char *src);
 extern char *strcat(char *dst, const char *src);
 extern char *strncpy(char *dst, const char *src, uint32_t n);
+extern void lib_strncat(char *dst, const char *src, int n);
 extern int strncmp(const char *s1, const char *s2, uint32_t n);
 extern int atoi(const char *nptr);
 extern int abs(int n);
 
 // --- 符號與 Linker 修復 ---
-void *stdout = (void*)1;
-int fputs(const char *s, void *stream) { lib_printf("%s", s); return 0; }
+FILE *stdout = (FILE*)1;
+int fputs(const char *s, FILE *stream) { (void)stream; lib_printf("%s", s); return 0; }
 char *getcwd(char *buf, size_t size) { if (buf) lib_strcpy(buf, "/root"); return buf; }
 
 extern int jit_debug_is_paused(void);
@@ -30,6 +44,12 @@ extern void jit_debug_set_location(const char *file, int line);
 extern void jit_debug_set_pc(uint32_t pc);
 extern int jit_debug_probe(const char *file, int line);
 extern void jit_debug_record_line_pc(uint32_t pc, const char *file, int line);
+extern void jit_debug_record_line_pc_probe(uint32_t pc, const char *file, int line);
+extern void jit_debug_record_line_range(uint32_t start_pc, uint32_t end_pc, const char *file, int line);
+extern void jit_debug_record_line_range_ex(uint32_t start_pc, uint32_t end_pc,
+                                           const char *file, int line,
+                                           uint32_t column, uint32_t discriminator,
+                                           uint16_t flags, uint16_t isa);
 extern void jit_debug_begin(void);
 extern void jit_debug_cleanup_code_patches(void);
 extern void jit_debug_set_code_range(uint32_t lo, uint32_t hi);
@@ -55,7 +75,12 @@ int debug_probe(const char *file, int line) {
     uint32_t caller_pc;
     asm volatile("mv %0, ra" : "=r"(caller_pc));
     jit_debug_set_pc(caller_pc);
-    return jit_debug_probe(file, line);
+    jit_debug_record_line_pc_probe(caller_pc, file, line);
+    jit_debug_set_location(file, line);
+    if (jit_debug_probe(file, line)) {
+        debug_break();
+    }
+    return 0;
 }
 
 // 基礎字串/數字轉換
@@ -126,7 +151,7 @@ static int jit_stdio_mode_to_flags(const char *mode) {
     return -1;
 }
 
-void *fopen(const char *path, const char *mode) {
+FILE *fopen(const char *path, const char *mode) {
     int flags = jit_stdio_mode_to_flags(mode);
     int fd;
     if (flags < 0) return NULL;
@@ -142,31 +167,31 @@ void *fopen(const char *path, const char *mode) {
         return NULL;
     }
     *pfd = fd;
-    return (void*)pfd;
+    return (FILE*)pfd;
 }
-int fclose(void *fp) {
+int fclose(FILE *fp) {
     if (!fp) return -1;
     appfs_close(*(int*)fp);
     free(fp);
     return 0;
 }
-size_t fread(void *ptr, size_t size, size_t nmemb, void *fp) {
+size_t fread(void *ptr, size_t size, size_t nmemb, FILE *fp) {
     if (!fp) return 0;
     int rc = appfs_read(*(int*)fp, ptr, size * nmemb);
     if (rc > 0 && ptr) jit_watch_access((uint32_t)(uintptr_t)ptr, (uint32_t)rc, 1);
     return (rc > 0) ? (size_t)rc / size : 0;
 }
-size_t fwrite(const void *ptr, size_t size, size_t nmemb, void *fp) {
+size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *fp) {
     if (!fp) return 0;
     if (ptr && size && nmemb) jit_watch_access((uint32_t)(uintptr_t)ptr, (uint32_t)(size * nmemb), 0);
     int rc = appfs_write(*(int*)fp, ptr, size * nmemb);
     return (rc > 0) ? (size_t)rc / size : 0;
 }
-int fseek(void *fp, long offset, int whence) {
+int fseek(FILE *fp, long offset, int whence) {
     if (!fp) return -1;
     return appfs_seek(*(int*)fp, (int)offset, whence) < 0 ? -1 : 0;
 }
-long ftell(void *fp) {
+long ftell(FILE *fp) {
     if (!fp) return -1;
     return (long)appfs_tell(*(int*)fp);
 }
@@ -236,6 +261,8 @@ struct jit_job {
     unsigned int slice_start_ms;
     TCCState *tcc;
     int (*main_func)(void);
+    uint32_t text_lo;
+    uint32_t text_hi;
     uint8_t *uheap;
     struct jit_ublock *uheap_head;
     void *kptrs[JIT_MAX_KPTRS];
@@ -264,6 +291,7 @@ struct jit_source_buf {
 };
 
 void os_jit_init(void);
+int os_jit_cancel_by_owner(int owner_win_id);
 static void jit_yield(void);
 static void jit_maybe_yield(void);
 
@@ -288,11 +316,682 @@ static void jit_debug_build_line_map_from_ebreaks(uint32_t lo, uint32_t hi) {
     for (uint32_t pc = lo; pc + 4 <= hi && idx < jit_debug_probe_site_count; pc += 4) {
         uint32_t insn = *(volatile uint32_t *)(uintptr_t)pc;
         if (insn != 0x00100073) continue;
-        jit_debug_record_line_pc(pc + 4,
-                                 jit_debug_probe_sites[idx].file,
-                                 jit_debug_probe_sites[idx].line);
+        jit_debug_record_line_pc_probe(pc + 4,
+                                       jit_debug_probe_sites[idx].file,
+                                       jit_debug_probe_sites[idx].line);
         idx++;
     }
+}
+
+#define JIT_DWARF_DIR_TABLE_MAX 64
+#define JIT_DWARF_FILE_TABLE_MAX 256
+#define JIT_DEBUG_LINE_FLAG_IS_STMT         0x0001u
+#define JIT_DEBUG_LINE_FLAG_BASIC_BLOCK     0x0002u
+#define JIT_DEBUG_LINE_FLAG_PROLOGUE_END    0x0004u
+#define JIT_DEBUG_LINE_FLAG_EPILOGUE_BEGIN  0x0008u
+#define JIT_DEBUG_LINE_FLAG_END_SEQUENCE    0x0010u
+
+struct dwarf_entry_format {
+    unsigned type;
+    unsigned form;
+};
+
+struct dwarf_filename_entry {
+    unsigned dir_index;
+    char *name;
+};
+
+struct jit_dwarf_line_state {
+    addr_t address;
+    unsigned file_index;
+    unsigned column;
+    unsigned op_index;
+    unsigned isa;
+    unsigned discriminator;
+    int line;
+    unsigned is_stmt;
+    unsigned basic_block;
+    unsigned prologue_end;
+    unsigned epilogue_begin;
+    unsigned end_sequence;
+    unsigned file_index_is_default;
+};
+
+struct jit_dwarf_pending_row {
+    int valid;
+    uint32_t start_pc;
+    int line;
+    uint32_t column;
+    uint32_t discriminator;
+    uint16_t flags;
+    uint16_t isa;
+    char file[256];
+};
+
+struct jit_dwarf_line_stats {
+    unsigned rows;
+    unsigned ranges;
+    unsigned sequences;
+    unsigned stmt_rows;
+    unsigned prologue_rows;
+    unsigned epilogue_rows;
+    unsigned synthetic_rows;
+    unsigned logged_ranges;
+    unsigned dropped_logs;
+};
+
+static unsigned long long jit_dwarf_read_uleb128(unsigned char **p, unsigned char *end) {
+    unsigned long long value = 0;
+    unsigned shift = 0;
+    while (*p < end) {
+        unsigned char byte = *(*p)++;
+        value |= (unsigned long long)(byte & 0x7f) << shift;
+        if (!(byte & 0x80)) break;
+        shift += 7;
+    }
+    return value;
+}
+
+static long long jit_dwarf_read_sleb128(unsigned char **p, unsigned char *end) {
+    unsigned long long value = 0;
+    unsigned shift = 0;
+    unsigned char byte = 0;
+    while (*p < end) {
+        byte = *(*p)++;
+        value |= (unsigned long long)(byte & 0x7f) << shift;
+        shift += 7;
+        if (!(byte & 0x80)) break;
+    }
+    if ((shift < 64) && (byte & 0x40)) value |= ~0ULL << shift;
+    return (long long)value;
+}
+
+static unsigned jit_dwarf_read_1(unsigned char **p, unsigned char *end) {
+    if (*p >= end) return 0;
+    return *(*p)++;
+}
+
+static unsigned jit_dwarf_read_2(unsigned char **p, unsigned char *end) {
+    unsigned v0 = jit_dwarf_read_1(p, end);
+    unsigned v1 = jit_dwarf_read_1(p, end);
+    return v0 | (v1 << 8);
+}
+
+static unsigned long long jit_dwarf_read_4(unsigned char **p, unsigned char *end) {
+    unsigned long long v = 0;
+    for (int i = 0; i < 4; i++) v |= (unsigned long long)jit_dwarf_read_1(p, end) << (i * 8);
+    return v;
+}
+
+static unsigned long long jit_dwarf_read_8(unsigned char **p, unsigned char *end) {
+    unsigned long long v = 0;
+    for (int i = 0; i < 8; i++) v |= (unsigned long long)jit_dwarf_read_1(p, end) << (i * 8);
+    return v;
+}
+
+static void jit_dwarf_skip_form(unsigned char **p, unsigned char *end, unsigned form, unsigned length) {
+    switch (form) {
+    case DW_FORM_string:
+        while (*p < end && **p) (*p)++;
+        if (*p < end) (*p)++;
+        break;
+    case DW_FORM_data1:
+        jit_dwarf_read_1(p, end);
+        break;
+    case DW_FORM_data2:
+        jit_dwarf_read_2(p, end);
+        break;
+    case DW_FORM_data4:
+    case DW_FORM_line_strp:
+    case DW_FORM_strp:
+    case DW_FORM_sec_offset:
+        jit_dwarf_read_4(p, end);
+        break;
+    case DW_FORM_data8:
+        jit_dwarf_read_8(p, end);
+        break;
+    case DW_FORM_udata:
+        jit_dwarf_read_uleb128(p, end);
+        break;
+    case DW_FORM_flag_present:
+        break;
+    default:
+        if (length == 8) jit_dwarf_read_8(p, end);
+        else jit_dwarf_read_4(p, end);
+        break;
+    }
+}
+
+static addr_t jit_dwarf_read_addr(unsigned char **p, unsigned char *end, unsigned addr_size) {
+    addr_t value = 0;
+    if (!addr_size) addr_size = sizeof(addr_t);
+    if (addr_size > sizeof(addr_t)) addr_size = sizeof(addr_t);
+    for (unsigned i = 0; i < addr_size && *p < end; i++) {
+        value |= (addr_t)jit_dwarf_read_1(p, end) << (i * 8);
+    }
+    return value;
+}
+
+static char *jit_dwarf_read_path_form(unsigned char **p, unsigned char *end, unsigned form,
+                                      unsigned length, unsigned char *line_str, unsigned char *debug_str) {
+    unsigned long long off;
+    char *path = NULL;
+    switch (form) {
+    case DW_FORM_string:
+        path = (char *)*p;
+        while (*p < end && **p) (*p)++;
+        if (*p < end) (*p)++;
+        break;
+    case DW_FORM_line_strp:
+        off = (length == 8) ? jit_dwarf_read_8(p, end) : jit_dwarf_read_4(p, end);
+        if (line_str) path = (char *)line_str + off;
+        break;
+    case DW_FORM_strp:
+        off = (length == 8) ? jit_dwarf_read_8(p, end) : jit_dwarf_read_4(p, end);
+        if (debug_str) path = (char *)debug_str + off;
+        break;
+    default:
+        jit_dwarf_skip_form(p, end, form, length);
+        break;
+    }
+    return path;
+}
+
+static void jit_dwarf_reset_line_state(struct jit_dwarf_line_state *state, unsigned default_is_stmt) {
+    if (!state) return;
+    memset(state, 0, sizeof(*state));
+    state->file_index = 1;
+    state->line = 1;
+    state->is_stmt = default_is_stmt ? 1u : 0u;
+    state->file_index_is_default = 1;
+}
+
+static void jit_dwarf_advance_addr(struct jit_dwarf_line_state *state,
+                                   unsigned long long op_advance,
+                                   unsigned min_insn_length,
+                                   unsigned max_ops_per_insn) {
+    if (!state) return;
+    if (!max_ops_per_insn) max_ops_per_insn = 1;
+    if (max_ops_per_insn == 1) {
+        state->address += (addr_t)(op_advance * min_insn_length);
+        return;
+    }
+    state->address += (addr_t)(((state->op_index + op_advance) / max_ops_per_insn) * min_insn_length);
+    state->op_index = (unsigned)((state->op_index + op_advance) % max_ops_per_insn);
+}
+
+static uint16_t jit_dwarf_line_flags(const struct jit_dwarf_line_state *state) {
+    uint16_t flags = 0;
+    if (!state) return 0;
+    if (state->is_stmt) flags |= JIT_DEBUG_LINE_FLAG_IS_STMT;
+    if (state->basic_block) flags |= JIT_DEBUG_LINE_FLAG_BASIC_BLOCK;
+    if (state->prologue_end) flags |= JIT_DEBUG_LINE_FLAG_PROLOGUE_END;
+    if (state->epilogue_begin) flags |= JIT_DEBUG_LINE_FLAG_EPILOGUE_BEGIN;
+    if (state->end_sequence) flags |= JIT_DEBUG_LINE_FLAG_END_SEQUENCE;
+    return flags;
+}
+
+static void jit_debug_join_path(char *out, int out_max, const char *dir, const char *name) {
+    if (!out || out_max <= 0) return;
+    out[0] = '\0';
+    if (!name || !name[0]) return;
+    if (name[0] == '/' || !dir || !dir[0]) {
+        strncpy(out, name, out_max - 1);
+        out[out_max - 1] = '\0';
+        return;
+    }
+    strncpy(out, dir, out_max - 1);
+    out[out_max - 1] = '\0';
+    if (out[0] && out[strlen(out) - 1] != '/') lib_strncat(out, "/", out_max - (int)strlen(out) - 1);
+    lib_strncat(out, name, out_max - (int)strlen(out) - 1);
+}
+
+static int jit_debug_path_is_synthetic(const char *path) {
+    const char *base = path;
+    size_t len;
+    if (!path || !path[0]) return 1;
+    while (*path) {
+        if (*path == '/' || *path == '\\') base = path + 1;
+        path++;
+    }
+    len = strlen(base);
+    if (strcmp(base, "<string>") == 0) return 1;
+    if (len >= 2 && base[0] == '<' && base[len - 1] == '>') return 1;
+    return 0;
+}
+
+static const char *jit_debug_path_for_index(char *out, int out_max,
+                                            struct dwarf_filename_entry *files,
+                                            unsigned file_count,
+                                            char **dirs, unsigned dir_count,
+                                            unsigned file_index) {
+    const char *dir = NULL;
+    if (!out || out_max <= 0) return NULL;
+    out[0] = '\0';
+    if (!file_count || file_index >= file_count) return NULL;
+    if (!files[file_index].name || !files[file_index].name[0]) return NULL;
+    if (files[file_index].dir_index < dir_count) {
+        dir = dirs[files[file_index].dir_index];
+    } else if (files[file_index].dir_index > 0 &&
+               files[file_index].dir_index - 1 < dir_count) {
+        dir = dirs[files[file_index].dir_index - 1];
+    }
+    jit_debug_join_path(out, out_max, dir, files[file_index].name);
+    return out[0] ? out : files[file_index].name;
+}
+
+static const char *jit_debug_current_fullpath(char *out, int out_max,
+                                              struct dwarf_filename_entry *files,
+                                              unsigned file_count,
+                                              char **dirs, unsigned dir_count,
+                                              unsigned file_index,
+                                              int file_index_is_default) {
+    char direct[256];
+    char fallback[256];
+    const char *primary = NULL;
+    const char *secondary = NULL;
+    if (!out || out_max <= 0) return NULL;
+    out[0] = '\0';
+    if (!file_count) return NULL;
+    if (file_index_is_default) {
+        if (file_index > 0) {
+            primary = jit_debug_path_for_index(fallback, sizeof(fallback),
+                                               files, file_count, dirs, dir_count,
+                                               file_index - 1);
+        }
+        secondary = jit_debug_path_for_index(direct, sizeof(direct),
+                                             files, file_count, dirs, dir_count,
+                                             file_index);
+    } else {
+        primary = jit_debug_path_for_index(direct, sizeof(direct),
+                                           files, file_count, dirs, dir_count,
+                                           file_index);
+        if (file_index > 0) {
+            secondary = jit_debug_path_for_index(fallback, sizeof(fallback),
+                                                 files, file_count, dirs, dir_count,
+                                                 file_index - 1);
+        }
+    }
+    if (primary && primary[0] && !jit_debug_path_is_synthetic(primary)) {
+        strncpy(out, primary, out_max - 1);
+        out[out_max - 1] = '\0';
+        return out;
+    }
+    if (secondary && secondary[0] && !jit_debug_path_is_synthetic(secondary)) {
+        strncpy(out, secondary, out_max - 1);
+        out[out_max - 1] = '\0';
+        return out;
+    }
+    if (primary && primary[0]) {
+        strncpy(out, primary, out_max - 1);
+        out[out_max - 1] = '\0';
+        return out;
+    }
+    if (secondary && secondary[0]) {
+        strncpy(out, secondary, out_max - 1);
+        out[out_max - 1] = '\0';
+        return out;
+    }
+    return NULL;
+}
+
+static void jit_dwarf_emit_pending_range(struct jit_dwarf_pending_row *pending,
+                                         uint32_t end_pc,
+                                         struct jit_dwarf_line_stats *stats) {
+    if (!pending || !pending->valid) return;
+    if (end_pc <= pending->start_pc) {
+        pending->valid = 0;
+        return;
+    }
+    jit_debug_record_line_range_ex(pending->start_pc, end_pc,
+                                   pending->file, pending->line,
+                                   pending->column, pending->discriminator,
+                                   pending->flags, pending->isa);
+    if (stats) {
+        stats->ranges++;
+        if (stats->logged_ranges < 96) {
+            lib_printf("[JITDBG] dwarf row %x..%x %s:%d col=%d flags=%x discr=%d isa=%d\n",
+                       pending->start_pc, end_pc,
+                       pending->file, pending->line,
+                       pending->column, pending->flags,
+                       pending->discriminator, pending->isa);
+            stats->logged_ranges++;
+        } else {
+            stats->dropped_logs++;
+        }
+    }
+    pending->valid = 0;
+}
+
+static void jit_dwarf_commit_row(struct jit_dwarf_pending_row *pending,
+                                 const struct jit_dwarf_line_state *state,
+                                 struct dwarf_filename_entry *files,
+                                 unsigned file_count,
+                                 char **dirs, unsigned dir_count,
+                                 uint32_t text_lo,
+                                 struct jit_dwarf_line_stats *stats) {
+    char fullpath[256];
+    const char *full;
+    uint16_t flags;
+    uint32_t row_pc;
+    if (!pending || !state) return;
+    row_pc = (uint32_t)state->address;
+    jit_dwarf_emit_pending_range(pending, row_pc, stats);
+    if (stats) {
+        stats->rows++;
+        if (state->is_stmt) stats->stmt_rows++;
+        if (state->prologue_end) stats->prologue_rows++;
+        if (state->epilogue_begin) stats->epilogue_rows++;
+        if (state->end_sequence) stats->sequences++;
+    }
+    if (state->end_sequence) return;
+    if (row_pc < text_lo) return;
+    if (state->line <= 0) return;
+    full = jit_debug_current_fullpath(fullpath, sizeof(fullpath),
+                                      files, file_count, dirs, dir_count,
+                                      state->file_index,
+                                      state->file_index_is_default);
+    if (!full || !full[0]) return;
+    if (jit_debug_path_is_synthetic(full)) {
+        if (stats) stats->synthetic_rows++;
+        return;
+    }
+    flags = jit_dwarf_line_flags(state);
+    pending->valid = 1;
+    pending->start_pc = row_pc;
+    pending->line = state->line;
+    pending->column = state->column;
+    pending->discriminator = state->discriminator;
+    pending->flags = flags;
+    pending->isa = (uint16_t)state->isa;
+    strncpy(pending->file, full, sizeof(pending->file) - 1);
+    pending->file[sizeof(pending->file) - 1] = '\0';
+}
+
+static void jit_dwarf_clear_row_flags(struct jit_dwarf_line_state *state) {
+    if (!state) return;
+    state->basic_block = 0;
+    state->prologue_end = 0;
+    state->epilogue_begin = 0;
+    state->discriminator = 0;
+}
+
+static int jit_debug_build_line_map_from_dwarf(TCCState *s) {
+    unsigned char *ln;
+    unsigned char *end_all;
+    unsigned char *line_str = NULL;
+    unsigned char *debug_str = NULL;
+    int mapped = 0;
+    struct jit_dwarf_line_stats total_stats;
+
+    memset(&total_stats, 0, sizeof(total_stats));
+
+    if (!s || !s->dwarf_line_section || !s->dwarf_line_section->data) return 0;
+    if (s->dwarf_line_str_section && s->dwarf_line_str_section->data) line_str = s->dwarf_line_str_section->data;
+    if (s->dwarf_str_section && s->dwarf_str_section->data) debug_str = s->dwarf_str_section->data;
+
+    ln = s->dwarf_line_section->data;
+    end_all = s->dwarf_line_section->data + s->dwarf_line_section->data_offset;
+    while (ln < end_all) {
+        unsigned char *unit = ln;
+        unsigned char *end;
+        unsigned char *opcode_lengths;
+        unsigned long long size = jit_dwarf_read_4(&ln, end_all);
+        unsigned length = 4;
+        unsigned version;
+        unsigned address_size = sizeof(addr_t);
+        unsigned segment_selector_size = 0;
+        unsigned long long header_length = 0;
+        unsigned min_insn_length;
+        unsigned max_ops_per_insn = 1;
+        unsigned default_is_stmt;
+        int line_base;
+        unsigned line_range;
+        unsigned opcode_base;
+        char *dirs[JIT_DWARF_DIR_TABLE_MAX];
+        struct dwarf_filename_entry files[JIT_DWARF_FILE_TABLE_MAX];
+        unsigned dir_count = 0;
+        unsigned file_count = 0;
+        struct jit_dwarf_line_state state;
+        struct jit_dwarf_pending_row pending;
+        struct jit_dwarf_line_stats stats;
+
+        memset(dirs, 0, sizeof(dirs));
+        memset(files, 0, sizeof(files));
+        memset(&pending, 0, sizeof(pending));
+        memset(&stats, 0, sizeof(stats));
+
+        if (size == 0xffffffffu) {
+            length = 8;
+            size = jit_dwarf_read_8(&ln, end_all);
+        }
+        end = ln + size;
+        if (end < unit || end > end_all) break;
+
+        version = jit_dwarf_read_2(&ln, end);
+        if (version >= 5) {
+            address_size = jit_dwarf_read_1(&ln, end);
+            segment_selector_size = jit_dwarf_read_1(&ln, end);
+            header_length = (length == 8) ? jit_dwarf_read_8(&ln, end) : jit_dwarf_read_4(&ln, end);
+        } else {
+            header_length = (length == 8) ? jit_dwarf_read_8(&ln, end) : jit_dwarf_read_4(&ln, end);
+        }
+        (void)segment_selector_size;
+        if (ln + header_length > end) {
+            ln = end;
+            continue;
+        }
+        min_insn_length = jit_dwarf_read_1(&ln, end);
+        if (version >= 4) max_ops_per_insn = jit_dwarf_read_1(&ln, end);
+        default_is_stmt = jit_dwarf_read_1(&ln, end);
+        line_base = (int)(signed char)jit_dwarf_read_1(&ln, end);
+        line_range = jit_dwarf_read_1(&ln, end);
+        opcode_base = jit_dwarf_read_1(&ln, end);
+        if (!line_range || !opcode_base || ln + (opcode_base - 1) > end) {
+            ln = end;
+            continue;
+        }
+        opcode_lengths = ln;
+        ln += opcode_base - 1;
+
+        if (version >= 5) {
+            struct dwarf_entry_format dir_fmt[16];
+            struct dwarf_entry_format file_fmt[16];
+            unsigned actual_dir_count;
+            unsigned actual_file_count;
+            unsigned fmt_count = jit_dwarf_read_1(&ln, end);
+            for (unsigned i = 0; i < fmt_count && i < 16; i++) {
+                dir_fmt[i].type = jit_dwarf_read_uleb128(&ln, end);
+                dir_fmt[i].form = jit_dwarf_read_uleb128(&ln, end);
+            }
+            actual_dir_count = (unsigned)jit_dwarf_read_uleb128(&ln, end);
+            dir_count = actual_dir_count;
+            if (dir_count > JIT_DWARF_DIR_TABLE_MAX) dir_count = JIT_DWARF_DIR_TABLE_MAX;
+            for (unsigned i = 0; i < actual_dir_count; i++) {
+                for (unsigned j = 0; j < fmt_count && j < 16; j++) {
+                    if (dir_fmt[j].type == DW_LNCT_path) {
+                        char *path = jit_dwarf_read_path_form(&ln, end, dir_fmt[j].form, length,
+                                                              line_str, debug_str);
+                        if (i < dir_count) dirs[i] = path;
+                    } else {
+                        jit_dwarf_skip_form(&ln, end, dir_fmt[j].form, length);
+                    }
+                }
+            }
+
+            fmt_count = jit_dwarf_read_1(&ln, end);
+            for (unsigned i = 0; i < fmt_count && i < 16; i++) {
+                file_fmt[i].type = jit_dwarf_read_uleb128(&ln, end);
+                file_fmt[i].form = jit_dwarf_read_uleb128(&ln, end);
+            }
+            actual_file_count = (unsigned)jit_dwarf_read_uleb128(&ln, end);
+            file_count = actual_file_count;
+            if (file_count > JIT_DWARF_FILE_TABLE_MAX) file_count = JIT_DWARF_FILE_TABLE_MAX;
+            for (unsigned i = 0; i < actual_file_count; i++) {
+                for (unsigned j = 0; j < fmt_count && j < 16; j++) {
+                    if (file_fmt[j].type == DW_LNCT_path) {
+                        char *path = jit_dwarf_read_path_form(&ln, end, file_fmt[j].form, length,
+                                                              line_str, debug_str);
+                        if (i < file_count) files[i].name = path;
+                    } else if (file_fmt[j].type == DW_LNCT_directory_index) {
+                        unsigned dir_index;
+                        if (file_fmt[j].form == DW_FORM_data1) dir_index = jit_dwarf_read_1(&ln, end);
+                        else if (file_fmt[j].form == DW_FORM_data2) dir_index = jit_dwarf_read_2(&ln, end);
+                        else if (file_fmt[j].form == DW_FORM_data4) dir_index = (unsigned)jit_dwarf_read_4(&ln, end);
+                        else dir_index = (unsigned)jit_dwarf_read_uleb128(&ln, end);
+                        if (i < file_count) files[i].dir_index = dir_index;
+                    } else {
+                        jit_dwarf_skip_form(&ln, end, file_fmt[j].form, length);
+                    }
+                }
+            }
+        } else {
+            while (ln < end && *ln) {
+                if (dir_count < JIT_DWARF_DIR_TABLE_MAX) dirs[dir_count++] = (char *)ln;
+                while (ln < end && *ln) ln++;
+                if (ln < end) ln++;
+            }
+            if (ln < end) ln++;
+            while (ln < end && *ln) {
+                if (file_count < JIT_DWARF_FILE_TABLE_MAX) {
+                    files[file_count].name = (char *)ln;
+                    while (ln < end && *ln) ln++;
+                    if (ln < end) ln++;
+                    files[file_count].dir_index = (unsigned)jit_dwarf_read_uleb128(&ln, end);
+                    jit_dwarf_read_uleb128(&ln, end);
+                    jit_dwarf_read_uleb128(&ln, end);
+                    file_count++;
+                } else {
+                    while (ln < end && *ln) ln++;
+                    if (ln < end) ln++;
+                    jit_dwarf_read_uleb128(&ln, end);
+                    jit_dwarf_read_uleb128(&ln, end);
+                    jit_dwarf_read_uleb128(&ln, end);
+                }
+            }
+            if (ln < end) ln++;
+        }
+
+        jit_dwarf_reset_line_state(&state, default_is_stmt);
+        while (ln < end) {
+            unsigned op = jit_dwarf_read_1(&ln, end);
+            if (op >= opcode_base) {
+                unsigned adj = op - opcode_base;
+                jit_dwarf_advance_addr(&state, adj / line_range, min_insn_length, max_ops_per_insn);
+                state.line += (int)(adj % line_range) + line_base;
+                jit_dwarf_commit_row(&pending, &state, files, file_count, dirs, dir_count,
+                                     (uint32_t)s->text_addr, &stats);
+                jit_dwarf_clear_row_flags(&state);
+                continue;
+            }
+
+            switch (op) {
+            case 0: {
+                unsigned len = (unsigned)jit_dwarf_read_uleb128(&ln, end);
+                unsigned char *cp = ln;
+                unsigned subop;
+                if (!len || ln + len > end) {
+                    ln = end;
+                    break;
+                }
+                subop = jit_dwarf_read_1(&cp, end);
+                if (subop == DW_LNE_end_sequence) {
+                    state.end_sequence = 1;
+                    jit_dwarf_commit_row(&pending, &state, files, file_count, dirs, dir_count,
+                                         (uint32_t)s->text_addr, &stats);
+                    jit_dwarf_reset_line_state(&state, default_is_stmt);
+                } else if (subop == DW_LNE_set_address) {
+                    state.address = jit_dwarf_read_addr(&cp, end, address_size);
+                    state.op_index = 0;
+                } else if (subop == DW_LNE_set_discriminator) {
+                    state.discriminator = (unsigned)jit_dwarf_read_uleb128(&cp, end);
+                }
+                ln += len;
+                break;
+            }
+            case DW_LNS_copy:
+                jit_dwarf_commit_row(&pending, &state, files, file_count, dirs, dir_count,
+                                     (uint32_t)s->text_addr, &stats);
+                jit_dwarf_clear_row_flags(&state);
+                break;
+            case DW_LNS_advance_pc:
+                jit_dwarf_advance_addr(&state, jit_dwarf_read_uleb128(&ln, end),
+                                       min_insn_length, max_ops_per_insn);
+                break;
+            case DW_LNS_advance_line:
+                state.line += (int)jit_dwarf_read_sleb128(&ln, end);
+                break;
+            case DW_LNS_set_file: {
+                unsigned idx = (unsigned)jit_dwarf_read_uleb128(&ln, end);
+                if ((idx < file_count) || (idx > 0 && idx - 1 < file_count)) {
+                    state.file_index = idx;
+                    state.file_index_is_default = 0;
+                }
+                break;
+            }
+            case DW_LNS_set_column:
+                state.column = (unsigned)jit_dwarf_read_uleb128(&ln, end);
+                break;
+            case DW_LNS_negate_stmt:
+                state.is_stmt = state.is_stmt ? 0u : 1u;
+                break;
+            case DW_LNS_set_basic_block:
+                state.basic_block = 1;
+                break;
+            case DW_LNS_const_add_pc: {
+                unsigned off = (255 - opcode_base) / line_range;
+                jit_dwarf_advance_addr(&state, off, min_insn_length, max_ops_per_insn);
+                break;
+            }
+            case DW_LNS_fixed_advance_pc:
+                state.address += (addr_t)jit_dwarf_read_2(&ln, end);
+                state.op_index = 0;
+                break;
+            case DW_LNS_set_prologue_end:
+                state.prologue_end = 1;
+                break;
+            case DW_LNS_set_epilogue_begin:
+                state.epilogue_begin = 1;
+                break;
+            case DW_LNS_set_isa:
+                state.isa = (unsigned)jit_dwarf_read_uleb128(&ln, end);
+                break;
+            default:
+                for (unsigned j = 0; j < opcode_lengths[op - 1]; j++) {
+                    jit_dwarf_read_uleb128(&ln, end);
+                }
+                break;
+            }
+        }
+        if (pending.valid) {
+            jit_dwarf_emit_pending_range(&pending, (uint32_t)state.address, &stats);
+        }
+        total_stats.synthetic_rows += stats.synthetic_rows;
+        total_stats.dropped_logs += stats.dropped_logs;
+        if (stats.ranges) {
+            mapped = 1;
+            total_stats.rows += stats.rows;
+            total_stats.ranges += stats.ranges;
+            total_stats.sequences += stats.sequences;
+            total_stats.stmt_rows += stats.stmt_rows;
+            total_stats.prologue_rows += stats.prologue_rows;
+            total_stats.epilogue_rows += stats.epilogue_rows;
+        }
+        ln = end;
+    }
+    if (mapped) {
+        lib_printf("[JITDBG] dwarf line rows=%u ranges=%u seq=%u stmt=%u pro=%u epi=%u\n",
+                   total_stats.rows, total_stats.ranges, total_stats.sequences,
+                   total_stats.stmt_rows, total_stats.prologue_rows, total_stats.epilogue_rows);
+        if (total_stats.synthetic_rows) {
+            lib_printf("[JITDBG] dwarf line skip synthetic=%u\n",
+                       total_stats.synthetic_rows);
+        }
+        if (total_stats.dropped_logs) {
+            lib_printf("[JITDBG] dwarf row logs truncated=%u\n", total_stats.dropped_logs);
+        }
+    }
+    return mapped;
 }
 
 static struct jit_job *jit_current_job(void) {
@@ -343,6 +1042,108 @@ static int jit_console_putchar(int c) {
     lib_putc((char)c);
     jit_debugger_console_write(owner, s);
     return c;
+}
+
+static void jit_dump_code_bytes(const char *tag, uint32_t center) {
+    uint32_t start = center >= 16 ? center - 16 : center;
+    lib_printf("[JITCODE] %s center=%x\n", tag ? tag : "code", center);
+    for (uint32_t off = 0; off < 64; off += 4) {
+        uint32_t addr = start + off;
+        uint16_t h0 = *(volatile uint16_t *)(uintptr_t)addr;
+        uint16_t h1 = *(volatile uint16_t *)(uintptr_t)(addr + 2);
+        uint32_t w = *(volatile uint32_t *)(uintptr_t)addr;
+        lib_printf("[JITCODE] addr=%x h0=%x h1=%x w=%x mark=%d\n",
+                   addr, h0, h1, w, addr == center);
+    }
+}
+
+static int32_t jit_rv32_i_imm(uint32_t insn) {
+    return (int32_t)insn >> 20;
+}
+
+static int32_t jit_rv32_s_imm(uint32_t insn) {
+    uint32_t imm = ((insn >> 25) << 5) | ((insn >> 7) & 0x1fu);
+    return (imm & 0x800u) ? (int32_t)(imm | 0xfffff000u) : (int32_t)imm;
+}
+
+static uint32_t jit_rv32_encode_sw(uint32_t rs1, uint32_t rs2, int32_t imm) {
+    uint32_t uimm = (uint32_t)imm & 0xfffu;
+    return 0x23u | (2u << 12) | (rs1 << 15) | (rs2 << 20) |
+           ((uimm & 0x1fu) << 7) | ((uimm >> 5) << 25);
+}
+
+static int jit_rv32_bare_mem_fault(uint32_t w) {
+    uint32_t op = w & 0x7fu;
+    uint32_t rs1 = (w >> 15) & 31u;
+    int32_t imm;
+    if (op == 0x03u) {
+        imm = jit_rv32_i_imm(w);
+    } else if (op == 0x23u) {
+        imm = jit_rv32_s_imm(w);
+    } else {
+        return 0;
+    }
+    return rs1 == 0u && imm >= -16 && imm < 4096;
+}
+
+static void jit_repair_main_prologue(uint32_t main_addr) {
+    uint32_t w0 = *(volatile uint32_t *)(uintptr_t)(main_addr + 0);
+    uint32_t w4 = *(volatile uint32_t *)(uintptr_t)(main_addr + 4);
+    uint32_t w8 = *(volatile uint32_t *)(uintptr_t)(main_addr + 8);
+    uint32_t w12 = *(volatile uint32_t *)(uintptr_t)(main_addr + 12);
+    int32_t frame = -jit_rv32_i_imm(w0);
+    int32_t ra_imm = jit_rv32_s_imm(w4);
+    int32_t s0_imm = frame - 8;
+    uint32_t patched;
+
+    lib_printf("[JITPROLOG] main=%x w0=%x w4=%x w8=%x w12=%x frame=%d ra_imm=%d\n",
+               main_addr, w0, w4, w8, w12, frame, ra_imm);
+
+    if ((w0 & 0x707f) != 0x13u || ((w0 >> 7) & 31u) != 2u || ((w0 >> 15) & 31u) != 2u) return;
+    if ((w4 & 0x707f) != 0x2023u || ((w4 >> 15) & 31u) != 2u || ((w4 >> 20) & 31u) != 1u) return;
+    if ((w12 & 0x707f) != 0x13u || ((w12 >> 7) & 31u) != 8u || ((w12 >> 15) & 31u) != 2u) return;
+    if (w8 != 0x23u) return;
+    if (frame <= 0 || frame > 2048) return;
+    if (ra_imm != frame - 4) return;
+
+    patched = jit_rv32_encode_sw(2, 8, s0_imm);
+    *(volatile uint32_t *)(uintptr_t)(main_addr + 8) = patched;
+    asm volatile("fence.i" ::: "memory");
+    lib_printf("[JITPATCH] fixed main sw-s0 addr=%x old=%x new=%x imm=%d\n",
+               main_addr + 8, w8, patched, s0_imm);
+}
+
+static void jit_check_broken_text(uint32_t lo, uint32_t hi) {
+    if (!lo || hi <= lo) return;
+    for (uint32_t pc = lo; pc + 4 <= hi; pc += 4) {
+        uint32_t w = *(volatile uint32_t *)(uintptr_t)pc;
+        if (w == 0x0000006fu) {
+            lib_printf("[JITERR] suspicious self-loop jal addr=%x word=%x prev=%x next=%x\n",
+                       pc, w,
+                       pc >= lo + 4 ? *(volatile uint32_t *)(uintptr_t)(pc - 4) : 0,
+                       pc + 8 <= hi ? *(volatile uint32_t *)(uintptr_t)(pc + 4) : 0);
+        } else if (w == 0x00000023u) {
+            lib_printf("[JITERR] suspicious bare store addr=%x word=%x prev=%x next=%x\n",
+                       pc, w,
+                       pc >= lo + 4 ? *(volatile uint32_t *)(uintptr_t)(pc - 4) : 0,
+                       pc + 8 <= hi ? *(volatile uint32_t *)(uintptr_t)(pc + 4) : 0);
+        } else if (jit_rv32_bare_mem_fault(w)) {
+            lib_printf("[JITERR] suspicious bare mem addr=%x word=%x prev=%x next=%x\n",
+                       pc, w,
+                       pc >= lo + 4 ? *(volatile uint32_t *)(uintptr_t)(pc - 4) : 0,
+                       pc + 8 <= hi ? *(volatile uint32_t *)(uintptr_t)(pc + 4) : 0);
+        } else if (w == 0x00000063u) {
+            lib_printf("[JITERR] suspicious bare branch addr=%x word=%x prev=%x next=%x\n",
+                       pc, w,
+                       pc >= lo + 4 ? *(volatile uint32_t *)(uintptr_t)(pc - 4) : 0,
+                       pc + 8 <= hi ? *(volatile uint32_t *)(uintptr_t)(pc + 4) : 0);
+        } else if (w == 0x00000003u || w == 0x00000067u) {
+            lib_printf("[JITWARN] suspicious bare insn addr=%x word=%x prev=%x next=%x\n",
+                       pc, w,
+                       pc >= lo + 4 ? *(volatile uint32_t *)(uintptr_t)(pc - 4) : 0,
+                       pc + 8 <= hi ? *(volatile uint32_t *)(uintptr_t)(pc + 4) : 0);
+        }
+    }
 }
 
 static void jit_maybe_yield(void) {
@@ -1359,12 +2160,23 @@ static int jit_debug_append_quoted_path(struct jit_source_buf *out, const char *
     return 0;
 }
 
+static int jit_debug_append_line_directive(struct jit_source_buf *out, const char *path, int line_no) {
+    char row[64];
+    if (!out || !path || !path[0] || line_no <= 0) return -1;
+    if (jit_source_buf_append_n(out, "#line ", 6) != 0) return -1;
+    snprintf(row, sizeof(row), "%d ", line_no);
+    if (jit_source_buf_append_n(out, row, strlen(row)) != 0) return -1;
+    if (jit_debug_append_quoted_path(out, path) != 0) return -1;
+    if (jit_source_buf_append_n(out, "\n", 1) != 0) return -1;
+    return 0;
+}
+
 static int jit_debug_append_probe(struct jit_source_buf *out, const char *path, int line_no) {
     char row[64];
     jit_debug_probe_sites_add(path, line_no);
-    if (jit_source_buf_append_n(out, "if(debug_probe(", 15) != 0) return -1;
+    if (jit_source_buf_append_n(out, "debug_probe(", 12) != 0) return -1;
     if (jit_debug_append_quoted_path(out, path ? path : "") != 0) return -1;
-    snprintf(row, sizeof(row), ",%d)) __asm__ __volatile__(\"ebreak\");\n", line_no);
+    snprintf(row, sizeof(row), ",%d);\n", line_no);
     if (jit_source_buf_append_n(out, row, strlen(row)) != 0) return -1;
     return 0;
 }
@@ -1382,6 +2194,10 @@ static int jit_debug_instrument_source(struct jit_source_buf *out, const char *s
         while (source[pos] && source[pos] != '\n') pos++;
         line_len = pos - line_start;
         depth_before = brace_depth;
+        if (jit_debug_append_line_directive(out, path ? path : "", line_no) != 0) {
+            if (msg && msg_size) snprintf(msg, msg_size, "JIT: debug source too large");
+            return -1;
+        }
         if (!in_block_comment && jit_debug_line_should_break(source + line_start, line_len, depth_before)) {
             if (jit_debug_append_probe(out, path, line_no) != 0) {
                 if (msg && msg_size) snprintf(msg, msg_size, "JIT: debug source too large");
@@ -1642,8 +2458,8 @@ static int jit_compile_job(struct jit_job *job, const char *source, char *msg, s
                job->id, (unsigned long)(uintptr_t)job->uheap, JIT_UHEAP_SIZE);
     lib_printf("[JITDBG] tcc_new s=%lx\n", (unsigned long)(uintptr_t)job->tcc);
     tcc_set_error_func(job->tcc, NULL, tcc_error_report);
-    tcc_set_options(job->tcc, "-nostdlib");
-    lib_printf("[JITDBG] options=-nostdlib\n");
+    tcc_set_options(job->tcc, "-nostdlib -gdwarf");
+    lib_printf("[JITDBG] options=-nostdlib -gdwarf\n");
     lib_printf("[JITDBG] set_output_type rc=%d\n", tcc_set_output_type(job->tcc, TCC_OUTPUT_MEMORY));
     lib_printf("[JITDBG] sym printf=%lx print=%lx get_ticks=%lx\n",
                (unsigned long)(uintptr_t)lib_printf,
@@ -1681,10 +2497,20 @@ static int jit_compile_job(struct jit_job *job, const char *source, char *msg, s
         return -1;
     }
     {
-        uint32_t code_lo = ((uint32_t)(uintptr_t)job->main_func) & ~0xffffu;
-        uint32_t code_hi = code_lo + 0x20000u;
+        unsigned long text_lo = 0;
+        unsigned long text_hi = 0;
+        uint32_t code_lo = (uint32_t)(uintptr_t)job->main_func;
+        uint32_t code_hi = code_lo + 4u;
+        if (tcc_get_text_bounds(job->tcc, &text_lo, &text_hi) == 0) {
+            code_lo = (uint32_t)text_lo;
+            code_hi = (uint32_t)text_hi;
+        }
+        lib_printf("[JITDBG] text=%lx..%lx\n",
+                   (unsigned long)code_lo, (unsigned long)code_hi);
+        job->text_lo = code_lo;
+        job->text_hi = code_hi;
         jit_debug_set_code_range(code_lo, code_hi);
-        if (jit_debug_probe_site_count > 0) {
+        if (!jit_debug_build_line_map_from_dwarf(job->tcc) && jit_debug_probe_site_count > 0) {
             jit_debug_build_line_map_from_ebreaks(code_lo, code_hi);
         }
     }
@@ -1710,6 +2536,25 @@ static void jit_job_execute(struct jit_job *job) {
     job->cancel_requested = 0;
     job->slice_start_ms = get_millisecond_timer();
     asm volatile("fence.i");
+    jit_repair_main_prologue((uint32_t)(uintptr_t)job->main_func);
+    jit_check_broken_text(job->text_lo, job->text_hi);
+    jit_dump_code_bytes("before-main", (uint32_t)(uintptr_t)job->main_func);
+    {
+        uint32_t main_addr = (uint32_t)(uintptr_t)job->main_func;
+        uint32_t main_word = *(volatile uint32_t *)(uintptr_t)main_addr;
+        if ((main_addr & 3u) != 0 || (main_word & 3u) != 3u) {
+            lib_printf("[JITERR] invalid main entry addr=%x word=%x low2=%x\n",
+                       main_addr, main_word, main_word & 3u);
+            job->exit_code = -3;
+            job->state = JIT_JOB_FAILED;
+            jit_job_cleanup(job);
+            if (!job->bg && job->waiter_task_id >= 0) {
+                task_wake(job->waiter_task_id);
+                task_sleep_current();
+            }
+            return;
+        }
+    }
     lib_printf("[JITDBG] job=%d call main\n", job->id);
     job->exit_code = job->main_func();
     lib_printf("[JITDBG] job=%d main returned rc=%d\n", job->id, job->exit_code);
@@ -1904,14 +2749,22 @@ int os_jit_run_bg_file(const char *path, int owner_win_id, char *msg, size_t msg
 
 int os_jit_run_bg_debug_file(const char *path, int owner_win_id, char *msg, size_t msg_size) {
     char local_msg[128];
-    char *source = jit_load_debug_source_from_path(path, local_msg, sizeof(local_msg));
+    char *source;
     int rc;
+    if (owner_win_id >= 0) os_jit_cancel_by_owner(owner_win_id);
+    source = jit_load_debug_source_from_path(path, local_msg, sizeof(local_msg));
     if (!source) {
         if (msg && msg_size) snprintf(msg, msg_size, "%s", local_msg[0] ? local_msg : "JIT: failed");
         return -1;
     }
     jit_debug_begin();
-    jit_debug_codegen_watch_enabled = 1;
+    /*
+     * The RISC-V load/store watch codegen path injects a large save/call/restore
+     * sequence around memory operations. It currently emits illegal halfwords in
+     * JIT text, which breaks instruction stepping. Keep debugger stepping stable;
+     * explicit watch state and libc/appfs wrapper hits still work.
+     */
+    jit_debug_codegen_watch_enabled = 0;
     rc = os_jit_run_bg(source, owner_win_id, msg, msg_size);
     jit_debug_codegen_watch_enabled = 0;
     free(source);
